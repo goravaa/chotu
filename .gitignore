@@ -216,3 +216,81 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+.DS_Store
+Thumbs.db
+
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build outputs
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test / coverage outputs
+*.test
+coverage.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+
+# Real/local configuration
+config/config.yaml
+config/*.local.yaml
+
+# Local runtime data
+chotu/data/
+chotu/tmp/
+chotu/logs/
+
+
+# Terraform working directory
+terraform/.terraform/
+
+# State files
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/crash.log
+terraform/crash.*.log
+
+# Terraform plan files
+terraform/*.tfplan
+terraform/*.plan
+
+# Terraform-generated override files
+terraform/override.tf
+terraform/override.tf.json
+terraform/*_override.tf
+terraform/*_override.tf.json
+
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+*.crt
+
+# AWS CLI local credentials/config should normally stay outside
+# the repository, but ignore accidental copies.
+.aws/
+aws-credentials*
+credentials*
+
+*.log
+*.tmp
+*.temp
+.tmp/
+tmp/
