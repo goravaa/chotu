@@ -1,1 +1,37 @@
-#Control Plane
+# Chotu user-facing machine configuration.
+# Compatibility-critical package and driver versions are controlled by bootstrap.
+
+persistence: true
+
+inference:
+  runtime: vllm
+  model: cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
+  quantization: awq
+  access: local
+  image: vllm/vllm-openai:latest
+  port: 8000
+  resources:
+    max_model_len: 14336
+    gpu_memory_utilization: 0.97
+    output_limit: 4096
+
+tooling:
+  packages:
+    - git
+    - tmux
+    - htop
+    - nvtop
+
+sync:
+  bucket: ""
+  prefix: workspace
+  interval: 1m
+  exclusions:
+    - .git/**
+    - node_modules/**
+    - .venv/**
+    - __pycache__/**
+    - .cache/**
+
+status_page:
+  port: 8080

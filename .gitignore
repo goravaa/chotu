@@ -294,3 +294,6 @@ credentials*
 *.temp
 .tmp/
 tmp/
+
+notes/
+notes/notes.md

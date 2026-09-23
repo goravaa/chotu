@@ -1,751 +1,459 @@
-I don't want to invent the Docker/NVIDIA Toolkit installation steps. Your notes establish that Docker and the NVIDIA runtime were working, but they **don't contain the commands used to install Docker or `nvidia-container-toolkit`**.
+Chotu — Manual Target Environment Notes
+0. Objective
 
-So I'll document those as verified prerequisites rather than fabricate an installation procedure. Everything else below is based on your notes and corrections.
+The purpose of this manual run was to establish and verify the complete target Chotu environment on a real AWS g6.xlarge before writing the bootstrap automation.
 
-# EC2 G6 + Docker + vLLM + OpenCode Setup
+Target:
 
-## 1. Overview
+AWS g6.xlarge
+├── Ubuntu 22.04
+├── NVIDIA L4 24 GB
+├── NVIDIA host driver
+├── NVIDIA Container Toolkit
+├── Docker
+├── vLLM
+├── Qwen3-Coder 30B AWQ
+├── OpenCode
+├── workspace/
+├── rclone
+├── S3 persistence
+├── IAM instance role
+└── scheduled workspace → S3 sync
 
-This document records the working setup used to run **OpenCode against a local vLLM server** on an AWS EC2 G6 instance.
+Important principle:
 
-### Final stack
+Manual environment first → verify every component → only then write bootstrap.sh/Terraform.
 
-```text
-AWS EC2 g6.xlarge
-        │
-        ├── NVIDIA L4 (~24 GB VRAM)
-        │
-        ├── Ubuntu
-        │
-        ├── Docker
-        │     └── containerd
-        │
-        ├── vLLM
-        │     └── Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
-        │
-        └── OpenCode
-              └── OpenAI-compatible API
-                    │
-                    └── localhost:8000
-```
+1. EC2 Machine
 
-### AWS configuration
+Machine:
 
-* **Instance:** `g6.xlarge`
-* **Region:** `ap-south-1`
-* **GPU:** NVIDIA L4
-* **GPU memory:** ~24 GB
-* **Root disk:** ~80 GB EBS
-* **Additional disk:** ~233 GB instance-store NVMe
-
----
-
-# 2. Machine / GPU
-
-The instance was an:
-
-```text
-AWS EC2 G6.xlarge
-Region: ap-south-1
+Instance: g6.xlarge
 GPU: NVIDIA L4
 VRAM: ~24 GB
-```
+vCPU: 4
+RAM: 16 GiB
 
-The initial GPU check was:
+Region used:
 
-```bash
-lspci | grep -i nvidia
-```
+ap-south-1
 
-Output:
+Current machine kernel observed:
 
-```text
-NVIDIA Corporation AD104GL [L4]
-```
+6.8.0-1063-aws
+2. Storage Architecture
 
-Initially, `nvidia-smi` was unavailable.
+This run deliberately tested the persistent/stoppable mode.
 
-NVIDIA utilities/drivers were then installed and configured. After that:
+/
+└── EBS
+    └── persistent
 
-```bash
-nvidia-smi
-```
+/data
+└── EC2 instance-store NVMe
+    └── ephemeral
 
-showed:
+Root disk:
 
-```text
-NVIDIA L4
-Driver Version: 580.173.02
+~80 GB EBS
+~72 GB free during testing
+
+Instance store:
+
+~229 GB filesystem
+mounted at /data
+
+Filesystem label:
+
+chotu-data
+
+/etc/fstab:
+
+LABEL=chotu-data /data ext4 defaults,nofail 0 2
+
+Unmount/remount of /data was successfully tested.
+
+Directories created:
+
+/data/docker
+/data/containerd
+/data/huggingface
+Important design decision
+
+For persistent mode, Docker remains on EBS:
+
+Docker Root Dir: /var/lib/docker
+
+We deliberately did not move Docker/containerd/model cache to /data.
+
+The older notes represented an ephemeral mode where:
+
+/data/docker
+/data/containerd
+/data/huggingface
+
+were used.
+
+Chotu needs to support both:
+
+Persistent mode
+EBS
+├── Docker
+├── model cache
+├── workspace
+└── persistent local state
+
+/data
+└── optional ephemeral workloads
+Ephemeral mode
+small EBS root
+/data
+├── Docker
+├── containerd
+├── models
+└── workspace
+3. NVIDIA Host Driver
+
+The live machine ended up using:
+
+nvidia-driver-580-server
+Version: 580.178.04
+
+and:
+
+nvidia-utils-580-server
+Version: 580.178.04
+
+nvidia-smi successfully showed:
+
+Driver Version: 580.178.04
 CUDA Version: 13.0
-Memory: 23034 MiB
-```
+GPU: NVIDIA L4
+VRAM: 23034 MiB
 
-This confirmed that the **host GPU and NVIDIA driver stack were working**.
+Example:
 
----
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 580.178.04
+| Driver Version: 580.178.04
+| CUDA Version: 13.0
+| NVIDIA L4
+| 23034 MiB
++-----------------------------------------------------------------------------+
 
-# 3. Disk Layout
+GPU was idle after setup.
 
-The machine initially appeared to have two NVMe devices:
+Important discrepancy
 
-```bash
-lsblk
-```
+The original project specification had:
 
-Approximately:
+NVIDIA 535
+CUDA 12.2.2
 
-```text
-nvme0n1       80G
-├─nvme0n1p1   6.9G   /
-├─nvme0n1p13  1G     /boot
-├─nvme0n1p14  4M
-└─nvme0n1p15  106M   /boot/efi
+but the actual working machine used:
 
-nvme1n1       232.8G
-```
+NVIDIA 580.178.04
+CUDA 13.0
 
-`nvme1n1` initially had no filesystem.
+Therefore bootstrap should not blindly hardcode the old documented 535 stack without resolving the compatibility decision.
 
-The important distinction was:
+The live machine is evidence of a working newer stack.
 
-```text
-nvme0n1 → EBS root volume
-nvme1n1 → EC2 instance-store NVMe
-```
+4. NVIDIA Container Toolkit
 
-The instance-store NVMe does **not** appear as a normal EBS volume because it is physically local storage attached to the EC2 host.
+Installed:
 
-## Important: instance-store is ephemeral
+nvidia-container-toolkit 1.20.1-1
+nvidia-container-toolkit-base 1.20.1-1
+libnvidia-container-tools 1.20.1-1
+libnvidia-container1 1.20.1-1
 
-The ~233 GB NVMe is **not persistent storage**.
+Version:
 
-It can be mounted and configured in `/etc/fstab`, which makes it automatically mount again **if the same instance and its instance-store device remain available**.
+nvidia-ctk --version
+1.20.1
 
-However, the data does **not** survive replacement/recreation of the EC2 instance.
+NVIDIA official repository was configured.
 
-This was confirmed during the setup: after the instance was stopped/recreated, the instance-store NVMe was no longer persistent and the `/data` setup had to be recreated.
+Then:
+
+sudo nvidia-ctk runtime configure --runtime=docker
+
+Generated:
+
+{
+    "runtimes": {
+        "nvidia": {
+            "args": [],
+            "path": "nvidia-container-runtime"
+        }
+    }
+}
+
+in:
+
+/etc/docker/daemon.json
+5. NVIDIA CDI
+
+There was initially a problem where CDI detected zero GPUs because NVIDIA userspace/NVML was incomplete.
+
+We restored the NVIDIA userspace packages:
+
+nvidia-driver-580-server
+nvidia-utils-580-server
+
+rebooted, then started:
+
+sudo systemctl start nvidia-cdi-refresh.service
+
+After that:
+
+sudo nvidia-ctk cdi list
+
+returned:
+
+nvidia.com/gpu=0
+nvidia.com/gpu=GPU-e87227ff-f15e-44b6-17fd-381050d5fdae
+nvidia.com/gpu=all
+
+Also verified:
+
+libnvidia-ml.so
+libnvidia-ml.so.1
+
+were available through ldconfig.
+
+6. Docker
+
+Docker was installed from the official Docker APT repository, not Ubuntu docker.io and not Snap.
+
+Live version:
+
+Docker Engine 29.8.1
+
+Docker info showed:
+
+Storage Driver: overlayfs
+Driver Type: io.containerd.snapshotter.v1
+
+Cgroup Driver: systemd
+Cgroup Version: 2
+
+Runtimes:
+io.containerd.runc.v2
+nvidia
+runc
+
+Default Runtime:
+runc
+
+Docker Root Dir:
+/var/lib/docker
+
+System:
+
+Ubuntu 22.04.5 LTS
+x86_64
+4 CPUs
+15.01 GiB RAM
+
+Docker and containerd were active.
+
+7. First GPU Container Test
+
+We verified the complete host → container GPU path:
+
+sudo docker run --rm \
+  --runtime=nvidia \
+  --gpus all \
+  ubuntu \
+  nvidia-smi
+
+This successfully showed the L4 inside the container.
 
 Therefore:
 
-```text
-/data on instance-store
-        ↓
-Fast + large
-        ↓
-Ephemeral
-        ↓
-Do NOT store the only copy of important data
-```
+Host L4
+ ↓
+NVIDIA driver
+ ↓
+NVML
+ ↓
+NVIDIA Container Toolkit
+ ↓
+Docker
+ ↓
+Container
+ ↓
+nvidia-smi
+
+was verified.
+
+8. vLLM Image GPU Test
+
+We pulled:
 
-The instance-store disk was suitable for disposable data such as:
-
-* Docker images
-* containerd data
-* Hugging Face model cache
-* benchmark scratch space
-* temporary datasets
-
----
-
-# 4. Format and Mount the Instance-Store NVMe
-
-The 233 GB NVMe was formatted with ext4:
-
-```bash
-sudo mkfs.ext4 /dev/nvme1n1
-```
-
-A mount point was created:
-
-```bash
-sudo mkdir -p /data
-sudo mount /dev/nvme1n1 /data
-```
-
-The mount was verified with:
-
-```bash
-df -h /data
-```
-
-Result:
-
-```text
-/dev/nvme1n1    229G    2.1M    217G    1%    /data
-```
-
----
-
-# 5. Configure Automatic Mounting
-
-The NVMe filesystem UUID was obtained using:
-
-```bash
-sudo blkid /dev/nvme1n1
-```
-
-The filesystem was then added to:
-
-```bash
-sudo nano /etc/fstab
-```
-
-The mount configuration was tested with:
-
-```bash
-sudo umount /data
-sudo mount -a
-```
-
-A systemd warning appeared:
-
-```text
-fstab has been modified, but systemd still uses the old version
-```
-
-This was resolved with:
-
-```bash
-sudo systemctl daemon-reload
-```
-
-The mount itself was successful.
-
-### Important clarification
-
-This configuration **does not make the instance-store persistent**.
-
-It only means:
-
-> When `/dev/nvme1n1` exists on this instance, Linux can automatically mount it at `/data` during boot.
-
-It does **not** turn instance-store into EBS storage.
-
----
-
-# 6. Expand the Root EBS Volume
-
-The root EBS volume was approximately 80 GB, but the root partition initially occupied only about 7.4 GB.
-
-The situation was approximately:
-
-```text
-Disk:             ~85.9 GB
-Root partition:   ~7.4 GB
-Unallocated:      ~77.3 GB
-```
-
-The partition table was inspected using:
-
-```bash
-sudo parted /dev/nvme0n1 print free
-```
-
-This produced a warning similar to:
-
-```text
-Warning: Not all of the space available ... appears to be used
-Fix/Ignore?
-```
-
-`Fix` was selected.
-
-After fixing the GPT information, the layout showed approximately:
-
-```text
-/dev/nvme0n1
-    p1       7.4G
-    free     77.3G
-```
-
-The root partition was then expanded:
-
-```bash
-sudo growpart /dev/nvme0n1 1
-```
-
-The ext4 filesystem was expanded:
-
-```bash
-sudo resize2fs /dev/nvme0n1p1
-```
-
-The root EBS filesystem could then use the previously unallocated capacity.
-
----
-
-# 7. Docker
-
-Docker was installed on the Ubuntu host and configured to use the NVIDIA runtime.
-
-The NVIDIA container tooling was also configured so Docker containers could access the L4 GPU.
-
-The important verification was that Docker could use the NVIDIA runtime and that the existing Docker configuration contained:
-
-```text
-nvidia-container-runtime
-```
-
-The exact installation commands for Docker and `nvidia-container-toolkit` are intentionally not reproduced here because they were not captured in the original notes.
-
----
-
-# 8. The Docker Storage Problem
-
-The first major issue after installing Docker was not the GPU or Docker itself.
-
-Pulling the vLLM image failed with:
-
-```text
-write /var/lib/containerd/...: no space left on device
-```
-
-This was confusing because:
-
-```bash
-df -h /data
-```
-
-showed approximately:
-
-```text
-217 GB free
-```
-
-The actual storage situation was:
-
-```text
-/                         → small root EBS filesystem
-/data                     → ~229 GB instance-store NVMe
-
-/var/lib/containerd      → root filesystem
-```
-
-Therefore Docker/containerd was attempting to unpack the very large vLLM image onto the small root filesystem.
-
-The free space on `/data` was irrelevant until Docker and containerd were configured to use it.
-
----
-
-# 9. Configure Docker to Use `/data`
-
-The existing Docker configuration was located at:
-
-```bash
-/etc/docker/daemon.json
-```
-
-It already contained the NVIDIA runtime configuration:
-
-```json
-{
-  "runtimes": {
-    "nvidia": {
-      "args": [],
-      "path": "nvidia-container-runtime"
-    }
-  }
-}
-```
-
-That configuration was preserved while Docker's data directory was moved to `/data`.
-
-The resulting configuration was:
-
-```json
-{
-  "data-root": "/data/docker",
-  "runtimes": {
-    "nvidia": {
-      "args": [],
-      "path": "nvidia-container-runtime"
-    }
-  }
-}
-```
-
-The directory was created:
-
-```bash
-sudo mkdir -p /data/docker
-```
-
-Docker was restarted:
-
-```bash
-sudo systemctl restart docker
-```
-
-The Docker root directory was verified:
-
-```bash
-docker info | grep "Docker Root Dir"
-```
-
-Result:
-
-```text
-Docker Root Dir: /data/docker
-```
-
----
-
-# 10. Move containerd Storage to `/data`
-
-Changing Docker's `data-root` was **not sufficient**.
-
-The containerd image/snapshot storage was still using:
-
-```text
-/var/lib/containerd
-```
-
-on the root filesystem.
-
-Therefore containerd also had to be moved to the large NVMe disk.
-
-## Stop Docker and containerd
-
-```bash
-sudo systemctl stop docker.socket
-sudo systemctl stop docker
-sudo systemctl stop containerd
-```
-
-## Generate containerd configuration
-
-```bash
-sudo mkdir -p /etc/containerd
-containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
-```
-
-The generated configuration used:
-
-```text
-root = '/var/lib/containerd'
-```
-
-This was changed to:
-
-```text
-root = '/data/containerd'
-```
-
-using:
-
-```bash
-sudo sed -i "s#root = '/var/lib/containerd'#root = '/data/containerd'#" /etc/containerd/config.toml
-```
-
-Verify:
-
-```bash
-grep '^root' /etc/containerd/config.toml
-```
-
-Expected:
-
-```text
-root = '/data/containerd'
-```
-
-Create the new directory:
-
-```bash
-sudo mkdir -p /data/containerd
-```
-
-Reload systemd:
-
-```bash
-sudo systemctl daemon-reload
-```
-
-Restart containerd:
-
-```bash
-sudo systemctl restart containerd
-```
-
-Start Docker:
-
-```bash
-sudo systemctl start docker
-```
-
-Verify containerd:
-
-```bash
-systemctl is-active containerd
-```
-
-Expected:
-
-```text
-active
-```
-
-Verify Docker:
-
-```bash
-docker info | grep "Docker Root Dir"
-```
-
-Expected:
-
-```text
-Docker Root Dir: /data/docker
-```
-
----
-
-# 11. Final Storage Layout
-
-The resulting storage arrangement was:
-
-```text
-EBS
-└── nvme0n1
-    └── /
-        ├── Ubuntu
-        ├── system packages
-        └── system files
-
-
-EC2 Instance-Store NVMe
-└── nvme1n1
-    └── /data
-        ├── docker/
-        ├── containerd/
-        └── huggingface/
-```
-
-The important distinction is:
-
-```text
-/       → EBS → persistent with the EBS volume
-/data   → instance-store → ephemeral
-```
-
-Verification:
-
-```bash
-df -h / /data
-```
-
-Approximately:
-
-```text
-/       6.7G   4.3G   2.3G
-/data   229G   2.3M   217G
-```
-
-The old containerd directory was checked:
-
-```bash
-sudo du -sh /data/containerd /data/docker
-sudo du -sh /var/lib/containerd
-```
-
-At that point the result was approximately:
-
-```text
-/data/containerd     92K
-/data/docker         184K
-/var/lib/containerd  154M
-```
-
-The `154 MB` under `/var/lib/containerd` was stale data left over from the failed image pull.
-
-Since containerd had been confirmed to use `/data/containerd`, the stale root-disk data could be removed:
-
-```bash
-sudo rm -rf /var/lib/containerd/*
-```
-
----
-
-# 12. vLLM
-
-The vLLM server was run using:
-
-```text
 vllm/vllm-openai:latest
-```
 
-The server exposed an OpenAI-compatible API on:
+Initially this command was attempted:
 
-```text
-http://127.0.0.1:8000/v1
-```
+sudo docker run --rm \
+  --gpus all \
+  vllm/vllm-openai:latest \
+  nvidia-smi
 
-The selected model was:
+It didn't execute nvidia-smi because the vLLM image's entrypoint is already the vLLM server.
 
-```text
-cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
-```
+It interpreted:
 
-The Hugging Face model cache was placed on the large NVMe:
+nvidia-smi
 
-```text
+as the model name and attempted to retrieve a Hugging Face repository called nvidia-smi.
+
+Correct test:
+
+sudo docker run --rm \
+  --gpus all \
+  --entrypoint nvidia-smi \
+  vllm/vllm-openai:latest
+
+Result:
+
+NVIDIA L4
+Driver 580.178.04
+CUDA 13.0
+23034 MiB
+
+So the actual vLLM container image could access the GPU.
+
+9. Persistent Hugging Face Cache
+
+Because this machine is the persistent/EBS mode, we did not use:
+
 /data/huggingface
-```
 
-and mounted into the container as:
+for the live model cache.
 
-```text
-/root/.cache/huggingface
-```
+Created:
 
-This avoids repeatedly downloading the model while the instance-store data remains available.
+/var/lib/chotu/huggingface
 
----
+and:
 
-# 13. vLLM Docker Command
+sudo chown -R $USER:$USER /var/lib/chotu
 
-The working container configuration was:
+This keeps model cache on the EBS-backed root filesystem.
 
-```bash
-docker run -d \
+10. vLLM Model
+
+Model:
+
+cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
+
+vLLM command:
+
+sudo docker run -d \
   --name qwen \
   --gpus all \
   --ipc=host \
   -p 8000:8000 \
-  -v /data/huggingface:/root/.cache/huggingface \
+  -v /var/lib/chotu/huggingface:/root/.cache/huggingface \
   vllm/vllm-openai:latest \
   --model cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --max-model-len 14336 \
   --gpu-memory-utilization 0.97
-```
 
-## Flag explanation
+Model loaded successfully.
 
-| Flag                                            | Purpose                                                           |
-| ----------------------------------------------- | ----------------------------------------------------------------- |
-| `--gpus all`                                    | Gives the container access to the NVIDIA L4                       |
-| `--ipc=host`                                    | Provides appropriate shared-memory configuration for the workload |
-| `-p 8000:8000`                                  | Exposes the vLLM API on port 8000                                 |
-| `-v /data/huggingface:/root/.cache/huggingface` | Stores the Hugging Face model cache on the NVMe                   |
-| `--enable-auto-tool-choice`                     | Enables automatic OpenAI-style tool calling                       |
-| `--tool-call-parser qwen3_coder`                | Parses Qwen3-Coder's native tool-call format                      |
-| `--max-model-len 14336`                         | Keeps the model within available L4 memory                        |
-| `--gpu-memory-utilization 0.97`                 | Allows vLLM to use most of the available GPU memory               |
+11. Why 14336 Context
 
----
+The model weights are approximately:
 
-# 14. Why `qwen3_coder` Tool Parser Matters
-
-The model emits its native tool-call format.
-
-The generic `hermes` parser was tested and did not correctly extract the model's tool calls.
-
-The resulting behavior was misleading:
-
-```text
-Model:
-"I'll use a tool..."
-```
-
-but OpenCode did not actually execute the tool.
-
-The correct parser is:
-
-```bash
---tool-call-parser qwen3_coder
-```
-
-Combined with:
-
-```bash
---enable-auto-tool-choice
-```
-
-this allows vLLM to expose the model's tool calls correctly through the OpenAI-compatible API.
-
----
-
-# 15. Why `--max-model-len 14336`
-
-The L4 has approximately 24 GB of VRAM.
-
-The AWQ model weights consume roughly:
-
-```text
 ~17 GB
-```
 
-Additional GPU memory is required for:
+The L4 has approximately:
 
-* CUDA graphs
-* runtime overhead
-* KV cache
+24 GB VRAM
 
-A 32,768-token context was too large for the available memory.
+Additional VRAM is required for:
 
-The selected value was:
+CUDA graphs
+runtime overhead
+KV cache
 
-```text
+32k context was too large in the previous setup.
+
+Working value:
+
 --max-model-len 14336
-```
 
-This fit within the available GPU memory while leaving room for the KV cache.
+GPU utilization:
 
----
+--gpu-memory-utilization 0.97
+12. vLLM API Verification
 
-# 16. Why the AWQ Model Was Selected
+After the model loaded:
 
-Several models were considered for a single 24 GB L4:
+curl http://localhost:8000/v1/models
 
-| Model                                            | Result                                                |
-| ------------------------------------------------ | ----------------------------------------------------- |
-| `Qwen/Qwen3-0.6B`                                | Runs, but too weak for useful agentic coding          |
-| `Qwen/Qwen3-Coder-30B-A3B-Instruct` BF16         | ~62 GB; does not fit on one L4                        |
-| `cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit` | **Selected; ~17 GB and works with tools**             |
-| Other AWQ repositories                           | Available, but some carried significant-loss warnings |
+returned:
 
-The selected model was:
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit",
+      "object": "model",
+      "owned_by": "vllm",
+      "max_model_len": 14336
+    }
+  ]
+}
 
-```text
-cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
-```
+Therefore:
 
----
+vLLM server
+      ↓
+OpenAI-compatible API
+      ↓
+localhost:8000/v1
 
-# 17. Verify vLLM
+was verified.
 
-After starting the container:
+13. OpenCode
 
-```bash
-docker ps
-```
+OpenCode was installed using:
 
-The server needs several minutes to load the model.
+curl -fsSL https://opencode.ai/install | bash
 
-The API can be checked with:
+Installed version:
 
-```bash
-curl -s http://127.0.0.1:8000/v1/models | head -c 200
-```
+1.18.31
 
-A successful response confirms that the OpenAI-compatible endpoint is available.
+The installer added OpenCode to:
 
----
+/home/ubuntu/.bashrc
 
-# 18. OpenCode Configuration
+The first shell did not immediately recognize it because the current shell hadn't reloaded .bashrc.
 
-The OpenCode configuration was placed in:
+Fix:
 
-```text
-opencode.json
-```
+source ~/.bashrc
 
-at the project root.
+Then:
 
-The working configuration was:
+opencode --version
 
-```json
+worked.
+
+The second installation attempt using sudo was unnecessary; OpenCode is installed under the user's home environment.
+
+14. OpenCode Configuration
+
+The working configuration:
+
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "vllm/cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit",
@@ -768,306 +476,624 @@ The working configuration was:
     }
   }
 }
-```
 
-## Important OpenCode configuration details
+Located at:
 
-The provider field is:
+~/workspace/opencode.json
 
-```json
-"provider"
-```
+Important configuration details:
 
-not:
-
-```json
-"providers"
-```
-
-The package field is:
-
-```json
-"npm"
-```
+provider
 
 not:
 
-```json
-"package"
-```
+providers
 
-The API URL belongs under:
+and:
 
-```json
-"options": {
-  "baseURL": "..."
-}
-```
+npm
 
-The model identifier follows:
+not:
 
-```text
-provider-id/model-id
-```
+package
 
-Therefore:
+API endpoint:
 
-```text
+http://127.0.0.1:8000/v1
+
+Model identifier:
+
 vllm/cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
-```
+15. Workspace-Level OpenCode Configuration
 
-The OpenCode context limit was matched to vLLM's:
+Workspace structure:
 
-```text
---max-model-len 14336
-```
+~/workspace/
+├── opencode.json
+└── project/
 
-### Restart OpenCode after changing the configuration
+OpenCode was launched from:
 
-OpenCode loads its configuration at startup.
+~/workspace/project
 
-After modifying `opencode.json`, fully quit and restart OpenCode.
+and successfully discovered/used the parent:
 
----
+~/workspace/opencode.json
 
-# 19. End-to-End Tool-Calling Test
+This was actually tested, not assumed.
 
-The final smoke test was:
+Therefore the desired Chotu structure works:
 
-```bash
-opencode run "List the files in the current directory using a tool and report what you find."
-```
+workspace/
+├── opencode.json
+├── project1/
+├── project2/
+└── project3/
 
-Expected behavior:
+with a shared OpenCode configuration at workspace level.
 
-```text
+This created a functional MVP-like architecture:
+
+workspace/
+   ↓
 OpenCode
    ↓
-vLLM API
+shared config
+   ↓
+local vLLM
    ↓
 Qwen3-Coder
-   ↓
-tool call
-   ↓
-OpenCode executes bash/ls
-   ↓
-tool result returned to model
-   ↓
-model summarizes result
-```
 
-The important thing to verify is **actual tool execution**, not merely text such as:
+OpenCode was observed writing code smoothly.
 
-```text
-"I'll use bash..."
-```
+16. OpenCode Tool Calling
 
-A successful test should show the model invoking the tool, receiving its output, and then producing the final response.
+We did not perform the final explicit tool-call smoke test.
 
----
+The documented test is:
 
-# 20. Troubleshooting
+opencode run \
+"List the files in the current directory using a tool and report what you find."
 
-## `no space left on device`
+The reason this matters is that previous testing showed the model could say:
 
-If the vLLM image pull fails with:
+"I'll use a tool..."
 
-```text
-no space left on device
-```
+without actually executing it when the wrong parser was used.
 
-check:
+The working vLLM flags are:
 
-```bash
-df -h / /data
-```
-
-Then check Docker:
-
-```bash
-docker info | grep "Docker Root Dir"
-```
-
-Expected:
-
-```text
-Docker Root Dir: /data/docker
-```
-
-Check containerd:
-
-```bash
-grep '^root' /etc/containerd/config.toml
-```
-
-Expected:
-
-```text
-root = '/data/containerd'
-```
-
-Both Docker **and** containerd need to use the large NVMe storage.
-
----
-
-## `auto tool choice requires --enable-auto-tool-choice`
-
-Add:
-
-```bash
 --enable-auto-tool-choice
-```
-
-to the vLLM command.
-
----
-
-## Model says it will use a tool but no tool executes
-
-Check:
-
-```bash
 --tool-call-parser qwen3_coder
-```
 
-Do not use the generic `hermes` parser for this Qwen3-Coder setup.
+We stopped before this final explicit test because the environment was already successfully functioning as an MVP.
 
-A useful diagnostic is to make a direct vLLM API request with a tool and:
+17. rclone
 
-```text
-tool_choice: "required"
-```
+Installed using:
 
-If the response contains the raw:
+curl https://rclone.org/install.sh | sudo bash
 
-```text
-<tool_call>...
-```
+The S3 bucket:
 
-XML rather than a structured tool call, the parser configuration is incorrect.
+chotu-324330563475-us-west-2-an
 
----
+ARN:
 
-## vLLM refuses to serve the model because of max model length
+arn:aws:s3:::chotu-324330563475-us-west-2-an
+18. IAM Architecture
 
-An error such as:
+We deliberately did not use AWS access keys on the machine.
 
-```text
-ValueError: To serve at least one request...
-max model length
-```
+Architecture:
 
-means the model weights plus runtime allocations leave insufficient GPU memory for the requested context.
+EC2
+ ↓
+IAM Instance Profile
+ ↓
+ChotuWorkspaceS3Role
+ ↓
+chotu-workspace-management
+ ↓
+S3 bucket
 
-Reduce:
+Role:
 
-```bash
---max-model-len
-```
+ChotuWorkspaceS3Role
 
-or adjust:
+Policy:
 
-```bash
---gpu-memory-utilization
-```
+chotu-workspace-management
 
-The working configuration used:
+The role was attached to the current g6.xlarge.
 
-```text
+AWS CLI was installed:
+
+sudo apt update
+sudo apt install -y awscli
+
+Then:
+
+aws sts get-caller-identity
+
+successfully returned the assumed role identity.
+
+This verified the EC2 instance role.
+
+19. IAM Policy
+
+Initial policy had a mistake.
+
+Bucket-level actions correctly used:
+
+"Resource": "arn:aws:s3:::chotu-324330563475-us-west-2-an"
+
+But object actions initially also used the bucket ARN.
+
+That caused:
+
+not authorized to perform: s3:PutObject
+
+Correct policy:
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WorkspaceBucketAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": "arn:aws:s3:::chotu-324330563475-us-west-2-an"
+    },
+    {
+      "Sid": "WorkspaceObjectAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::chotu-324330563475-us-west-2-an/*"
+    }
+  ]
+}
+
+Important distinction:
+
+Bucket actions
+arn:aws:s3:::bucket
+
+Object actions
+arn:aws:s3:::bucket/*
+20. rclone Configuration
+
+We directly injected:
+
+~/.config/rclone/rclone.conf
+
+with:
+
+[chotu-s3]
+type = s3
+provider = AWS
+env_auth = true
+region = us-west-2
+
+Important:
+
+env_auth = true
+
+means rclone obtains AWS credentials through the EC2 IAM role rather than stored access keys.
+
+Verified:
+
+rclone listremotes
+
+returned:
+
+chotu-s3:
+21. S3 Connectivity Test
+
+Initial test accidentally omitted part of the bucket name.
+
+Correct bucket:
+
+chotu-324330563475-us-west-2-an
+
+Then:
+
+rclone lsd chotu-s3:chotu-324330563475-us-west-2-an
+
+worked.
+
+And:
+
+rclone size chotu-s3:chotu-324330563475-us-west-2-an
+
+returned:
+
+Total objects: 0
+Total size: 0 B
+
+So:
+
+IAM → rclone → S3
+
+was verified.
+
+22. Workspace → S3 Sync
+
+Manual sync command:
+
+rclone sync ~/workspace \
+  chotu-s3:chotu-324330563475-us-west-2-an/workspace \
+  -P
+
+After fixing the object ARN, it successfully uploaded the workspace.
+
+Verified with:
+
+rclone ls chotu-s3:chotu-324330563475-us-west-2-an/workspace
+
+Example resulting objects:
+
+opencode.json
+project/README.md
+project/cache/cache_manager.py
+project/data_ingestion/__init__.py
+project/data_ingestion/__pycache__/...
+project/knowledge_graph/__init__.py
+project/knowledge_graph/__pycache__/...
+project/lineage/lineage_tracker.py
+project/main.py
+project/question_answering/__init__.py
+project/question_answering/__pycache__/...
+sync-test.txt
+
+Therefore actual:
+
+~/workspace
+      ↓
+    rclone
+      ↓
+S3 workspace prefix
+
+was verified.
+
+23. rclone Filter
+
+We noticed that the first sync uploaded things we don't want persisted, especially:
+
+__pycache__
+*.pyc
+
+The intended filter was:
+
+- opencode.json
+- .git/**
+- .venv/**
+- __pycache__/**
+- *.pyc
+- .pytest_cache/**
+- .mypy_cache/**
+- .ruff_cache/**
+- node_modules/**
+- .DS_Store
+
+The filter was kept outside the workspace:
+
+~/.config/chotu/workspace-filter
+
+rather than:
+
+~/workspace/.chotu-rclone-filter
+
+so Chotu's operational configuration isn't part of the user's project data.
+
+The sync script uses:
+
+--filter-from "$HOME/.config/chotu/workspace-filter"
+24. Sync Script
+
+Created:
+
+~/.local/bin/chotu-workspace-sync
+
+Contents:
+
+#!/bin/bash
+set -euo pipefail
+
+rclone sync "$HOME/workspace" \
+  "chotu-s3:chotu-324330563475-us-west-2-an/workspace" \
+  --filter-from "$HOME/.config/chotu/workspace-filter" \
+  --log-file "$HOME/.config/chotu/rclone-sync.log" \
+  --log-level INFO
+
+Executable permission:
+
+chmod +x ~/.local/bin/chotu-workspace-sync
+25. Log Rotation
+
+We wanted rclone logs to automatically expire/rotate.
+
+Created:
+
+/etc/logrotate.d/chotu-rclone
+
+with:
+
+/home/ubuntu/.config/chotu/rclone-sync.log {
+    daily
+    rotate 7
+    maxsize 10M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+
+Meaning:
+
+daily rotation
+7 retained rotations
+10 MB maximum trigger
+compressed old logs
+copytruncate so rclone keeps working
+26. Scheduled Sync
+
+We chose systemd user timer rather than writing a custom sync daemon.
+
+Service:
+
+~/.config/systemd/user/chotu-workspace-sync.service
+
+Contents:
+
+[Unit]
+Description=Chotu workspace S3 sync
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/chotu-workspace-sync
+
+Timer:
+
+~/.config/systemd/user/chotu-workspace-sync.timer
+
+Contents:
+
+[Unit]
+Description=Run Chotu workspace S3 sync
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+Unit=chotu-workspace-sync.service
+
+[Install]
+WantedBy=timers.target
+
+The 1-minute interval was intentionally used for testing.
+
+27. Scheduler Verification
+
+Initially the timer files hadn't actually been created.
+
+We created:
+
+mkdir -p ~/.config/systemd/user
+
+then the service and timer.
+
+Activated:
+
+systemctl --user daemon-reload
+systemctl --user enable --now chotu-workspace-sync.timer
+
+Verified:
+
+systemctl --user list-timers --all
+
+The timer triggered the service.
+
+28. Scheduler Failure and Fix
+
+First scheduled execution failed:
+
+status=203/EXEC
+
+with:
+
+Failed to locate executable
+/home/ubuntu/.local/bin/chotu-workspace-sync:
+Permission denied
+
+This proved the timer itself was firing.
+
+The issue was simply the executable bit.
+
+Fixed:
+
+chmod +x ~/.local/bin/chotu-workspace-sync
+
+Then manually triggered the systemd service:
+
+systemctl --user start chotu-workspace-sync.service
+
+It succeeded.
+
+This verified:
+
+systemd timer
+      ↓
+systemd service
+      ↓
+sync script
+      ↓
+rclone
+      ↓
+IAM
+      ↓
+S3
+29. Scheduler Test File
+
+Created:
+
+echo "scheduler test $(date)" > ~/workspace/scheduler-test.txt
+
+The scheduler successfully synchronized it to S3.
+
+The timer was therefore tested as an actual scheduled mechanism rather than simply manually executing rclone.
+
+30. Final Verified Architecture
+
+At the end of the manual build:
+
+                       AWS
+                        │
+                 g6.xlarge / L4
+                        │
+              ┌─────────┴─────────┐
+              │                   │
+            Ubuntu              Storage
+              │                   │
+       NVIDIA Driver              ├── EBS /
+              │                   │
+      NVIDIA Container            └── NVMe /data
+          Toolkit
+              │
+            Docker
+              │
+           vLLM
+              │
+     Qwen3-Coder 30B AWQ
+              │
+       OpenAI API :8000
+              │
+          OpenCode
+              │
+         ~/workspace
+              │
+        systemd timer
+              │
+           rclone
+              │
+        IAM Instance Role
+              │
+        S3 workspace
+31. Things We Have NOT Fully Verified
+
+These should not be falsely marked as complete in the bootstrap requirements:
+
+OpenCode explicit tool execution
+
+We verified OpenCode coding/inference, but didn't run the final explicit tool-call smoke test.
+
+Automatic startup restoration
+
+We verified workspace → S3 but did not implement/test:
+
+S3 → workspace
+
+on boot.
+
+Shutdown/final sync
+
+Not implemented/tested.
+
+Conflict handling
+
+No policy yet for:
+
+local changed
+S3 changed
+
+simultaneously.
+
+Bootstrap reproducibility
+
+The environment is manually verified, but bootstrap.sh has not yet recreated it from scratch.
+
+Terraform recreation
+
+Not yet tested from a clean machine.
+
+32. Important Bootstrap Inputs We Learned
+
+Bootstrap needs to account for the actual observed environment rather than copying old assumptions.
+
+GPU
+
+Observed working:
+
+NVIDIA driver 580.178.04
+CUDA 13.0
+NVIDIA Container Toolkit 1.20.1
+Docker
+
+Observed:
+
+Docker 29.8.1
+Docker Root Dir: /var/lib/docker
+
+for persistent mode.
+
+vLLM
+vllm/vllm-openai:latest
+Model
+cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
+vLLM configuration
+--enable-auto-tool-choice
+--tool-call-parser qwen3_coder
 --max-model-len 14336
 --gpu-memory-utilization 0.97
-```
-
----
-
-# 21. Quick Restart
-
-To recreate the vLLM container:
-
-```bash
-docker rm -f qwen 2>/dev/null
-```
-
-Then start it again:
-
-```bash
-docker run -d \
-  --name qwen \
-  --gpus all \
-  --ipc=host \
-  -p 8000:8000 \
-  -v /data/huggingface:/root/.cache/huggingface \
-  vllm/vllm-openai:latest \
-  --model cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit \
-  --enable-auto-tool-choice \
-  --tool-call-parser qwen3_coder \
-  --max-model-len 14336 \
-  --gpu-memory-utilization 0.97
-```
-
-Then wait for model loading to complete and check:
-
-```bash
-curl -s http://127.0.0.1:8000/v1/models | head -c 200
-```
-
----
-
-# 22. Final Working Configuration
-
-At the point where the setup was working, the important pieces were:
-
-```text
-AWS
-├── Region: ap-south-1
-├── Instance: g6.xlarge
-└── GPU: NVIDIA L4 (~24 GB)
-```
-
-```text
-Storage
-├── nvme0n1
-│   └── EBS
-│       └── /
-│
-└── nvme1n1
-    └── Instance-store NVMe
-        └── /data
-            ├── docker
-            ├── containerd
-            └── huggingface
-```
-
-```text
-Docker
-├── Docker Root Dir: /data/docker
-└── NVIDIA runtime: nvidia-container-runtime
-```
-
-```text
-containerd
-└── root: /data/containerd
-```
-
-```text
-vLLM
-├── Image: vllm/vllm-openai:latest
-├── Port: 8000
-├── Model: cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
-├── Context: 14336
-├── GPU utilization: 0.97
-└── Tool parser: qwen3_coder
-```
-
-```text
+Model cache persistent location
+/var/lib/chotu/huggingface
 OpenCode
-└── vllm/cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
-        ↓
-    http://127.0.0.1:8000/v1
-```
+1.18.31
+Workspace
+~/workspace
+Shared OpenCode configuration
+~/workspace/opencode.json
+rclone
+~/.config/rclone/rclone.conf
+Chotu sync configuration
+~/.config/chotu/workspace-filter
+~/.config/chotu/rclone-sync.log
+~/.local/bin/chotu-workspace-sync
+~/.config/systemd/user/chotu-workspace-sync.service
+~/.config/systemd/user/chotu-workspace-sync.timer
+33. Final State Before Destruction
 
-### One critical operational fact
+The machine has successfully demonstrated:
 
-The entire `/data` layer is backed by **EC2 instance-store**, not EBS.
+[✓] Real g6.xlarge
+[✓] Ubuntu
+[✓] L4 detected
+[✓] NVIDIA driver
+[✓] NVIDIA Container Toolkit
+[✓] CDI
+[✓] Docker GPU access
+[✓] vLLM container
+[✓] Qwen3-Coder model
+[✓] vLLM API
+[✓] OpenCode
+[✓] OpenCode → vLLM
+[✓] Shared workspace OpenCode config
+[✓] IAM role
+[✓] rclone
+[✓] rclone → S3
+[✓] Workspace → S3
+[✓] Filtering
+[✓] systemd scheduled sync
+[✓] scheduled sync actually executed
+[✓] log rotation configuration
 
-So although the configuration successfully moved Docker, containerd, and the Hugging Face cache off the tiny root filesystem, **none of that `/data` content should be treated as persistent storage across EC2 instance replacement/recreation**.
+The remaining work is now automation, not discovering how the environment works.
+
+And before terminating the instance, the ~/chotu-machine-snapshot/ collection we just created should be preserved. That snapshot is the useful bridge between “we know it works” and “now let's make Chotu build it automatically.”
