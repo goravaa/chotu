@@ -5,4 +5,7 @@ docker:
 	docker build -t chotu-status .
 
 run:
-	docker run --rm -p 8081:8081 chotu-status
+	docker run -d --name chotu-status -p 8081:8081 chotu-status
+
+stop:
+	docker stop chotu-status
