@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"syscall"
@@ -78,6 +79,14 @@ func run() int {
 	)
 	defer stop()
 
+	// The storage task creates the directory the database lives in, so keep the
+	// two in step when -db points somewhere other than the default.
+	if os.Getenv("CHOTU_STATE_DIR") == "" {
+		if err := os.Setenv("CHOTU_STATE_DIR", filepath.Dir(*dbPath)); err != nil {
+			log.Printf("set CHOTU_STATE_DIR: %v", err)
+		}
+	}
+
 	db, err := state.Open(*dbPath)
 	if err != nil {
 		log.Printf("open state database: %v", err)
@@ -100,7 +109,7 @@ func run() int {
 			ctx,
 			db,
 			*configPath,
-			setup.Tasks(),
+			setup.Tasks,
 			*attempts,
 			*retryDelay,
 		)
@@ -120,7 +129,7 @@ func run() int {
 		ctx,
 		db,
 		*configPath,
-		setup.Tasks(),
+		setup.Tasks,
 		*interval,
 		*attempts,
 		*retryDelay,
@@ -131,7 +140,7 @@ func runDaemon(
 	ctx context.Context,
 	db *sql.DB,
 	configPath string,
-	tasks []*setup.Task,
+	tasksFor func(*config.Config) []*setup.Task,
 	interval time.Duration,
 	attempts int,
 	retryDelay time.Duration,
@@ -154,7 +163,7 @@ func runDaemon(
 			ctx,
 			db,
 			configPath,
-			tasks,
+			tasksFor,
 			attempts,
 			retryDelay,
 		); err != nil {
@@ -180,7 +189,7 @@ func runCycle(
 	ctx context.Context,
 	db *sql.DB,
 	configPath string,
-	tasks []*setup.Task,
+	tasksFor func(*config.Config) []*setup.Task,
 	attempts int,
 	retryDelay time.Duration,
 ) ([]string, error) {
@@ -193,6 +202,10 @@ func runCycle(
 	if err != nil {
 		return nil, err
 	}
+
+	// The task list is built from the config that was just loaded, so a
+	// change to config.yaml takes effect on the next cycle.
+	tasks := tasksFor(cfg)
 
 	machine, err := state.GetMachine(db)
 	if err != nil {
