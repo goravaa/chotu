@@ -90,6 +90,32 @@ func TestLoadRejectsIncompleteEnabledFeatures(t *testing.T) {
 	})
 }
 
+// TestImagesArePinned stops a floating tag from creeping back in. `latest` moves
+// several times a week, and the vLLM command line changes with it, so an
+// unpinned image means a machine that worked this morning can fail this
+// afternoon with nothing in Chotu having changed.
+func TestImagesArePinned(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "..", "config.yaml"))
+	if err != nil {
+		t.Fatalf("load the shipped config: %v", err)
+	}
+
+	image := cfg.Inference.Image
+
+	if strings.HasSuffix(image, ":latest") || !strings.Contains(image, ":v") {
+		t.Errorf("inference.image = %q, want a version tag", image)
+	}
+
+	if !strings.Contains(image, "@sha256:") {
+		t.Errorf(
+			"inference.image = %q, want it pinned by digest. A version tag alone "+
+				"leaves the exact bytes unpinned; see the upgrade note in config.yaml "+
+				"for how to resolve a digest",
+			image,
+		)
+	}
+}
+
 // TestLoadReadsTheShippedConfig keeps the example config loadable. It is the
 // file every new machine starts from, so a field the loader does not recognise
 // is a silent behaviour change.

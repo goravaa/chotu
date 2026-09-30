@@ -71,7 +71,19 @@ inference:
   # / SSH tunnel rather than public exposure.
   access: local
   
-  image: vllm/vllm-openai:latest
+  # Pinned to an exact version and digest, deliberately.
+  #
+  # vLLM's `latest` tag moves several times a week and its command line changes
+  # with it, so a floating tag means a machine that worked this morning can fail
+  # this afternoon for reasons that have nothing to do with this config. The
+  # version tag says what is running; the digest says which bytes.
+  #
+  # To upgrade, pick a version from https://hub.docker.com/r/vllm/vllm-openai/tags
+  # and resolve its digest with:
+  #   docker buildx imagetools inspect vllm/vllm-openai:v0.30.0-x86_64
+  # The -x86_64 variant is used because Chotu only supports x86_64, and it keeps
+  # the tag and the digest describing the same platform image.
+  image: vllm/vllm-openai:v0.30.0-x86_64@sha256:5f5e535216848d0c52159c8c13a0af04be5f6fe1a84e79914300610796f76d40
   port: 8000
 
   resources:

@@ -1098,9 +1098,16 @@ func setupVLLM(cfg *config.Config, layout Layout) func(context.Context) error {
 	}
 }
 
+// defaultInferenceImage is the fallback when config.yaml does not name an
+// image. It is pinned to a version and a digest for the same reason the config
+// is: `latest` moves several times a week, and vLLM's command line changes with
+// it, so a machine can start failing without anything in Chotu changing.
+const defaultInferenceImage = "vllm/vllm-openai:v0.30.0-x86_64" +
+	"@sha256:5f5e535216848d0c52159c8c13a0af04be5f6fe1a84e79914300610796f76d40"
+
 func inferenceImage(cfg *config.Config) string {
 	if cfg == nil || cfg.Inference.Image == "" {
-		return "vllm/vllm-openai:latest"
+		return defaultInferenceImage
 	}
 
 	return cfg.Inference.Image
