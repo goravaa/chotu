@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goravaa/chotu/chotu-setup/internals/config"
 	"github.com/goravaa/chotu/chotu-setup/internals/setup"
 	"github.com/goravaa/chotu/chotu-setup/internals/state"
 )
@@ -102,10 +103,9 @@ func TestRunCycleMarksMachineReady(t *testing.T) {
 		context.Background(),
 		db,
 		cycleConfig(t, "model-a"),
-		tasks,
+		staticTasks(tasks),
 		testAttempts,
-		testRetryDelay,
-	)
+		testRetryDelay)
 	if err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
@@ -136,10 +136,9 @@ func TestRunCycleMarksMachineFailed(t *testing.T) {
 		context.Background(),
 		db,
 		cycleConfig(t, "model-a"),
-		tasks,
+		staticTasks(tasks),
 		testAttempts,
-		testRetryDelay,
-	)
+		testRetryDelay)
 	if err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
@@ -177,10 +176,9 @@ func TestRunCycleInterruptedDoesNotReportFailure(t *testing.T) {
 		ctx,
 		db,
 		cycleConfig(t, "model-a"),
-		tasks,
+		staticTasks(tasks),
 		testAttempts,
-		testRetryDelay,
-	)
+		testRetryDelay)
 
 	if err == nil {
 		t.Fatal("expected an error for an interrupted cycle")
@@ -203,10 +201,9 @@ func TestRunCycleRecoversAfterFailure(t *testing.T) {
 		context.Background(),
 		db,
 		configPath,
-		failing,
+		staticTasks(failing),
 		testAttempts,
-		testRetryDelay,
-	); err != nil {
+		testRetryDelay); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -220,10 +217,9 @@ func TestRunCycleRecoversAfterFailure(t *testing.T) {
 		context.Background(),
 		db,
 		configPath,
-		healthy,
+		staticTasks(healthy),
 		testAttempts,
-		testRetryDelay,
-	); err != nil {
+		testRetryDelay); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -243,10 +239,9 @@ func TestRunCycleRepeatedCyclesAreIdempotent(t *testing.T) {
 			context.Background(),
 			db,
 			configPath,
-			tasks,
+			staticTasks(tasks),
 			testAttempts,
-			testRetryDelay,
-		); err != nil {
+			testRetryDelay); err != nil {
 			t.Fatalf("cycle %d: %v", cycle, err)
 		}
 
@@ -278,10 +273,9 @@ func TestRunCyclePicksUpConfigChange(t *testing.T) {
 		context.Background(),
 		db,
 		configA,
-		tasks,
+		staticTasks(tasks),
 		testAttempts,
-		testRetryDelay,
-	); err != nil {
+		testRetryDelay); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -293,10 +287,9 @@ func TestRunCyclePicksUpConfigChange(t *testing.T) {
 		context.Background(),
 		db,
 		configB,
-		tasks,
+		staticTasks(tasks),
 		testAttempts,
-		testRetryDelay,
-	); err != nil {
+		testRetryDelay); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -314,10 +307,9 @@ func TestRunCycleMissingConfigIsAnError(t *testing.T) {
 		context.Background(),
 		db,
 		filepath.Join(t.TempDir(), "absent.yaml"),
-		[]*setup.Task{okTask("storage")},
+		staticTasks([]*setup.Task{okTask("storage")}),
 		testAttempts,
-		testRetryDelay,
-	)
+		testRetryDelay)
 
 	if err == nil {
 		t.Fatal("expected an error for a missing config")
@@ -371,11 +363,10 @@ func TestRunDaemonRepeatsCyclesAndStopsCleanly(t *testing.T) {
 			ctx,
 			db,
 			cycleConfig(t, "model-a"),
-			tasks,
+			staticTasks(tasks),
 			5*time.Millisecond,
 			testAttempts,
-			testRetryDelay,
-		)
+			testRetryDelay)
 	}()
 
 	time.Sleep(120 * time.Millisecond)
@@ -416,11 +407,10 @@ func TestRunDaemonStopsImmediatelyOnCancelledContext(t *testing.T) {
 		ctx,
 		db,
 		cycleConfig(t, "model-a"),
-		[]*setup.Task{okTask("storage")},
+		staticTasks([]*setup.Task{okTask("storage")}),
 		time.Hour,
 		testAttempts,
-		testRetryDelay,
-	)
+		testRetryDelay)
 
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0", code)
@@ -429,4 +419,10 @@ func TestRunDaemonStopsImmediatelyOnCancelledContext(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Errorf("took %s to notice the cancellation", elapsed)
 	}
+}
+
+// staticTasks adapts a fixed task list to the factory the daemon uses, so
+// tests can inject fixtures where production builds tasks from the config.
+func staticTasks(tasks []*setup.Task) func(*config.Config) []*setup.Task {
+	return func(*config.Config) []*setup.Task { return tasks }
 }

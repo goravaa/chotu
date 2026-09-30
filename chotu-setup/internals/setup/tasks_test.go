@@ -12,14 +12,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goravaa/chotu/chotu-setup/internals/config"
 	"github.com/goravaa/chotu/chotu-setup/internals/state"
 )
 
-// TestTasksGraphIsWellFormed checks the wiring in Tasks(): names are unique
+// TestTasksGraphIsWellFormed checks the wiring in Tasks(nil): names are unique
 // and every dependency refers to a task that actually exists. A typo here
 // otherwise only surfaces at runtime, as a failed task.
 func TestTasksGraphIsWellFormed(t *testing.T) {
-	tasks := Tasks()
+	tasks := Tasks(nil)
 
 	seen := make(map[string]bool, len(tasks))
 
@@ -57,7 +58,7 @@ func TestTasksGraphIsWellFormed(t *testing.T) {
 // runner cannot survive: each task blocks on its dependency's completion
 // channel, so two tasks waiting on each other hang Run forever.
 func TestTasksGraphHasNoCycles(t *testing.T) {
-	tasks := Tasks()
+	tasks := Tasks(nil)
 
 	byName := make(map[string]*Task, len(tasks))
 
@@ -108,10 +109,15 @@ func TestTasksGraphHasNoCycles(t *testing.T) {
 	}
 }
 
-// TestTasksRunToCompletion runs the real graph. The timeout guard turns a
-// deadlock into a test failure instead of a hung test binary.
-func TestTasksRunToCompletion(t *testing.T) {
-	tasks := Tasks()
+// runRealGraph runs the real task graph and returns the results. The timeout
+// guard turns a deadlock into a test failure instead of a hung test binary.
+func runRealGraph(t *testing.T) map[string]TaskResult {
+	t.Helper()
+
+	t.Setenv("CHOTU_STATE_DIR", t.TempDir())
+	t.Setenv("CHOTU_LOG_DIR", t.TempDir())
+
+	tasks := Tasks(&config.Config{})
 
 	finished := make(chan map[string]TaskResult, 1)
 
@@ -121,22 +127,183 @@ func TestTasksRunToCompletion(t *testing.T) {
 			Run(context.Background())
 	}()
 
-	var results map[string]TaskResult
-
 	select {
-	case results = <-finished:
+	case results := <-finished:
+		if len(results) != len(tasks) {
+			t.Fatalf("results = %d, want %d", len(results), len(tasks))
+		}
+
+		return results
 	case <-time.After(30 * time.Second):
 		t.Fatal("runner did not finish: the task graph deadlocked")
+		return nil
 	}
+}
 
-	if len(results) != len(tasks) {
-		t.Fatalf("results = %d, want %d", len(results), len(tasks))
-	}
+// TestRealGraphReachesATerminalStateForEveryTask runs the real bodies. The
+// assertions cannot be "everything succeeded", because a developer laptop
+// legitimately has no GPU and no rclone, and a task that reports that is
+// working correctly. What must always hold is that every task ends in a
+// terminal state, that nothing is left RUNNING, and that a task is never
+// marked COMPLETED when a task it depends on did not complete.
+func TestRealGraphReachesATerminalStateForEveryTask(t *testing.T) {
+	results := runRealGraph(t)
 
 	for name, result := range results {
-		if result.State != Completed {
-			t.Errorf("%s = %s (%v)", name, result.State, result.Error)
+		if result.State != Completed && result.State != Failed {
+			t.Errorf("%s = %s, want COMPLETED or FAILED", name, result.State)
 		}
+	}
+
+	// Every task in the graph must have been visited, otherwise a task added to
+	// the graph could quietly stop running.
+	for _, task := range Tasks(&config.Config{}) {
+		if _, ok := results[task.Name]; !ok {
+			t.Errorf("no result recorded for task %s", task.Name)
+		}
+	}
+}
+
+// TestRealBodiesRespectDependencies proves the real bodies are gated on their
+// dependencies. Pointing HOME at a path that cannot be created makes the rclone
+// body fail for any user, while s3 is disabled and would otherwise succeed, so
+// s3 must be skipped rather than run against a dependency that failed.
+func TestRealBodiesRespectDependencies(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+
+	t.Setenv("HOME", filepath.Join(blocked, "home"))
+	t.Setenv("CHOTU_STATE_DIR", t.TempDir())
+	t.Setenv("CHOTU_LOG_DIR", t.TempDir())
+
+	tasks := Tasks(&config.Config{})
+
+	results := NewRunner(tasks, nil).
+		WithRetryPolicy(1, time.Millisecond).
+		Run(context.Background())
+
+	if results[TaskRclone].State != Failed {
+		t.Fatalf("rclone = %s, want FAILED so the dependency is genuinely broken",
+			results[TaskRclone].State)
+	}
+
+	s3 := results[TaskS3]
+	if s3.State != Failed {
+		t.Fatalf("s3 = %s, want FAILED: it must be skipped when rclone fails",
+			s3.State)
+	}
+
+	if !strings.Contains(s3.Error.Error(), "did not complete") {
+		t.Errorf("s3 error = %q, want it to name the failed dependency", s3.Error)
+	}
+}
+
+// TestRealGraphReportsActionableErrors pins that a task which cannot finish
+// says why. An empty error would leave the status page showing a bare failure
+// with nothing to act on.
+func TestRealGraphReportsActionableErrors(t *testing.T) {
+	results := runRealGraph(t)
+
+	for name, result := range results {
+		if result.State != Failed {
+			continue
+		}
+
+		msg := result.Error.Error()
+		if len(msg) < 20 {
+			t.Errorf("%s failed with an unhelpful error: %q", name, msg)
+		}
+
+		if !strings.Contains(msg, "did not complete") &&
+			!strings.Contains(msg, "not installed") &&
+			!strings.Contains(msg, "not responding") &&
+			!strings.Contains(msg, "permission denied") {
+			t.Logf("%s failed: %s", name, msg)
+		}
+	}
+}
+
+// TestStorageTaskCreatesStateDirs proves the storage body does its work rather
+// than only reporting failure, using the environment override so the test needs
+// no root.
+func TestStorageTaskCreatesStateDirs(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "chotu-state")
+
+	t.Setenv("CHOTU_STATE_DIR", dir)
+	t.Setenv("CHOTU_LOG_DIR", filepath.Join(dir, "log"))
+
+	if err := setupStorage(&config.Config{})(context.Background()); err != nil {
+		t.Fatalf("setupStorage: %v", err)
+	}
+
+	for _, want := range []string{dir, filepath.Join(dir, "log")} {
+		if _, err := os.Stat(want); err != nil {
+			t.Errorf("storage task did not create %s: %v", want, err)
+		}
+	}
+}
+
+// TestStorageTaskVerifiesThePersistentVolume covers the difference between a
+// directory the task may create and a disk that has to be attached by the
+// provisioner. Creating the path would make the task pass on a machine with no
+// persistent storage at all.
+func TestStorageTaskVerifiesThePersistentVolume(t *testing.T) {
+	t.Setenv("CHOTU_STATE_DIR", t.TempDir())
+	t.Setenv("CHOTU_LOG_DIR", t.TempDir())
+
+	persist := &config.Config{}
+	persist.Machine.Storage.Persist = true
+
+	missing := filepath.Join(t.TempDir(), "no-such-disk")
+
+	t.Setenv("CHOTU_DATA_DIR", missing)
+
+	err := setupStorage(persist)(context.Background())
+	if err == nil {
+		t.Fatal("persist with no volume attached: want an error")
+	}
+
+	if !strings.Contains(err.Error(), "persist") {
+		t.Errorf("error = %q, want it to name machine.storage.persist", err)
+	}
+
+	present := t.TempDir()
+
+	t.Setenv("CHOTU_DATA_DIR", present)
+
+	if err := setupStorage(persist)(context.Background()); err != nil {
+		t.Errorf("persist with the volume attached: %v", err)
+	}
+
+	// With persist off the task must not care about the data directory.
+	t.Setenv("CHOTU_DATA_DIR", missing)
+
+	if err := setupStorage(&config.Config{})(context.Background()); err != nil {
+		t.Errorf("persist disabled: %v", err)
+	}
+}
+
+// TestDisabledFeaturesSucceed checks that features switched off in the config
+// are a no-op rather than a failure, since every task runs on every cycle.
+func TestDisabledFeaturesSucceed(t *testing.T) {
+	ctx := context.Background()
+
+	if err := setupS3(&config.Config{})(ctx); err != nil {
+		t.Errorf("s3 with enabled=false: %v", err)
+	}
+
+	if err := setupS3(&config.Config{S3: config.S3Config{Enabled: true}})(ctx); err == nil {
+		t.Error("s3 enabled with no bucket: want an error")
+	}
+
+	if err := setupOpenCode(&config.Config{})(ctx); err != nil {
+		t.Errorf("opencode disabled: %v", err)
+	}
+
+	if err := setupTooling(&config.Config{})(ctx); err != nil {
+		t.Errorf("tooling with no packages: %v", err)
 	}
 }
 
