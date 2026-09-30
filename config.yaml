@@ -9,16 +9,36 @@
 machine:
   # Cloud / provisioning configuration
   instance_type: g6.xlarge
-  image_id: ami-02167eae61967e403
+
+  # The Ubuntu 26.04 AMI to boot. This is a provisioning concern; the setup
+  # daemon only reports a warning if the machine turns out to be on a different
+  # Ubuntu release.
+  image_id: ""
+
   region: us-west-2
   ssh_key_path: .
-  use_spot: true
+
+  # A spot machine can be reclaimed at any moment, so it cannot also be
+  # persistent. This and storage.persist are two halves of one decision: spot
+  # pairs with persist: false, on-demand pairs with persist: true. The config
+  # loader rejects any other combination rather than building a machine that
+  # silently loses the workspace.
+  use_spot: false
 
   # Machine storage configuration
   storage:
+    # Set false for a disposable spot machine. The EC2 instance store is
+    # mounted at /data and the workspace, Docker root, model cache and Chotu
+    # state all live on it, so the machine can be reclaimed without losing work.
+    #
+    # Set true for an on-demand machine with a root disk that survives. The
+    # workspace, Docker root, model cache and Chotu state then live on the root
+    # disk below, and the instance store at /data is only scratch space.
+    persist: true
+
+    # Root disk sizing is a Terraform concern; the setup daemon only logs it.
     root_disk_size_gb: 80
     root_disk_type: gp2
-    persist: true
 
 
 # Persistent workspace storage and synchronization.
@@ -63,6 +83,14 @@ inference:
 # Development environment.
 coding:
   opencode: true
+
+
+# Progress page served over HTTP so the user can see what the machine is doing
+# while it comes up. Runs as a container pulled from a registry.
+status_page:
+  enabled: true
+  image: goravaa/chotu-status:latest
+  port: 8081
 
 
 # Additional development/build tools requested by the user.

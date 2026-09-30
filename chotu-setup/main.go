@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/goravaa/chotu/chotu-setup/internals/config"
+	"github.com/goravaa/chotu/chotu-setup/internals/publish"
 	"github.com/goravaa/chotu/chotu-setup/internals/setup"
 	"github.com/goravaa/chotu/chotu-setup/internals/state"
 )
@@ -23,6 +24,11 @@ const (
 	defaultStateDBPath = "/var/lib/chotu/chotu.db"
 	defaultInterval    = 60 * time.Second
 )
+
+// version is stamped in at build time by the makefile. The daemon runs for the
+// life of the machine, so the version it came from has to be recoverable from
+// the logs and the status page.
+var version = "dev"
 
 func main() {
 	os.Exit(run())
@@ -95,7 +101,8 @@ func run() int {
 	defer db.Close()
 
 	log.Printf(
-		"chotu-setup starting: config=%s db=%s interval=%s once=%t attempts=%d retry-delay=%s",
+		"chotu-setup %s starting: config=%s db=%s interval=%s once=%t attempts=%d retry-delay=%s",
+		version,
 		*configPath,
 		*dbPath,
 		*interval,
@@ -105,7 +112,7 @@ func run() int {
 	)
 
 	if *once {
-		failed, err := runCycle(
+		report, err := runCycle(
 			ctx,
 			db,
 			*configPath,
@@ -118,7 +125,9 @@ func run() int {
 			return 1
 		}
 
-		if len(failed) > 0 {
+		publishStatus(ctx, publish.NewCollector(), report, 1)
+
+		if failed := report.failed(); len(failed) > 0 {
 			return 1
 		}
 
@@ -147,6 +156,8 @@ func runDaemon(
 ) int {
 	cycles := 0
 
+	collector := publish.NewCollector()
+
 	for {
 		if ctx.Err() != nil {
 			log.Printf("shutdown requested; stopping after %d cycles", cycles)
@@ -159,15 +170,24 @@ func runDaemon(
 
 		log.Printf("setup cycle %d starting", cycles)
 
-		if _, err := runCycle(
+		cycle, err := runCycle(
 			ctx,
 			db,
 			configPath,
 			tasksFor,
 			attempts,
 			retryDelay,
-		); err != nil {
+		)
+		if err != nil {
 			log.Printf("setup cycle %d error: %v", cycles, err)
+		}
+
+		// Publish after every cycle, including a failed one. The user watching
+		// the page during a slow first boot is exactly who needs to see which
+		// task is stuck, so a cycle that reports nothing is the one case where
+		// staying quiet is wrong.
+		if cycle != nil {
+			publishStatus(ctx, collector, cycle, cycles)
 		}
 
 		log.Printf(
@@ -185,6 +205,58 @@ func runDaemon(
 	}
 }
 
+// cycleReport is what a finished cycle leaves behind. It carries the config and
+// layout the cycle ran against, because a report published from a later cycle's
+// config would describe a machine that never existed.
+type cycleReport struct {
+	Config       *config.Config
+	Layout       setup.Layout
+	Results      map[string]setup.TaskResult
+	MachineState string
+	Duration     time.Duration
+}
+
+func (r *cycleReport) failed() []string {
+	failed := make([]string, 0)
+
+	for name, result := range r.Results {
+		if result.State != setup.Completed {
+			failed = append(failed, name)
+		}
+	}
+
+	sort.Strings(failed)
+
+	return failed
+}
+
+// publishStatus sends the cycle's outcome to the status service. The publisher
+// is built per cycle from the config that cycle used, so a port change in
+// config.yaml takes effect without a restart.
+//
+// The collector is shared across cycles on purpose. It remembers the previous
+// CPU reading, because utilisation is only a delta; a fresh collector per cycle
+// would report zero forever and make the page useless.
+func publishStatus(ctx context.Context, collector *publish.Collector, report *cycleReport, cycles int) {
+	publisher := publish.NewPublisher(
+		"",
+		report.Config.StatusPage.Port,
+		report.Config.StatusPage.Enabled,
+	)
+
+	document := collector.Collect(ctx, publish.Options{
+		Version:      version,
+		Cycle:        cycles,
+		MachineState: report.MachineState,
+		Results:      report.Results,
+		Layout:       report.Layout,
+		StateDir:     report.Layout.StateDir,
+		Duration:     report.Duration,
+	})
+
+	publisher.Publish(ctx, document)
+}
+
 func runCycle(
 	ctx context.Context,
 	db *sql.DB,
@@ -192,7 +264,7 @@ func runCycle(
 	tasksFor func(*config.Config) []*setup.Task,
 	attempts int,
 	retryDelay time.Duration,
-) ([]string, error) {
+) (*cycleReport, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return nil, err
@@ -205,6 +277,7 @@ func runCycle(
 
 	// The task list is built from the config that was just loaded, so a
 	// change to config.yaml takes effect on the next cycle.
+	layout := setup.ResolveLayout(cfg)
 	tasks := tasksFor(cfg)
 
 	machine, err := state.GetMachine(db)
@@ -232,6 +305,8 @@ func runCycle(
 		return nil, err
 	}
 
+	started := time.Now()
+
 	runner := setup.NewRunner(tasks, state.NewStore(db)).
 		WithRetryPolicy(attempts, retryDelay)
 
@@ -244,15 +319,13 @@ func runCycle(
 		return nil, fmt.Errorf("cycle interrupted: %w", err)
 	}
 
-	failed := make([]string, 0)
-
-	for name, result := range results {
-		if result.State != setup.Completed {
-			failed = append(failed, name)
-		}
+	report := &cycleReport{
+		Config:  cfg,
+		Layout:  layout,
+		Results: results,
 	}
 
-	sort.Strings(failed)
+	failed := report.failed()
 
 	finalState := state.StateReady
 	if len(failed) > 0 {
@@ -264,8 +337,11 @@ func runCycle(
 		finalState,
 		configHash,
 	); err != nil {
-		return failed, err
+		return report, err
 	}
+
+	report.MachineState = string(finalState)
+	report.Duration = time.Since(started)
 
 	for _, name := range failed {
 		log.Printf("task %s failed: %v", name, results[name].Error)
@@ -277,7 +353,7 @@ func runCycle(
 		finalState,
 	)
 
-	return failed, nil
+	return report, nil
 }
 
 func defaultConfigPath() string {

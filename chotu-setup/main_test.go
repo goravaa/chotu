@@ -99,7 +99,7 @@ func TestRunCycleMarksMachineReady(t *testing.T) {
 
 	tasks := []*setup.Task{okTask("storage"), okTask("docker")}
 
-	failed, err := runCycle(
+	report, err := runCycle(
 		context.Background(),
 		db,
 		cycleConfig(t, "model-a"),
@@ -109,6 +109,8 @@ func TestRunCycleMarksMachineReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
+
+	failed := report.failed()
 
 	if len(failed) != 0 {
 		t.Fatalf("failed = %v, want none", failed)
@@ -132,7 +134,7 @@ func TestRunCycleMarksMachineFailed(t *testing.T) {
 		},
 	}
 
-	failed, err := runCycle(
+	report, err := runCycle(
 		context.Background(),
 		db,
 		cycleConfig(t, "model-a"),
@@ -144,6 +146,8 @@ func TestRunCycleMarksMachineFailed(t *testing.T) {
 	}
 
 	want := []string{"docker", "docker-gpu"}
+
+	failed := report.failed()
 
 	if len(failed) != len(want) {
 		t.Fatalf("failed = %v, want %v", failed, want)

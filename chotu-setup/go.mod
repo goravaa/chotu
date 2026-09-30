@@ -3,9 +3,15 @@ module github.com/goravaa/chotu/chotu-setup
 go 1.25.0
 
 require (
+	github.com/goravaa/chotu/status v0.0.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.59.0
 )
+
+// The status document is defined in one place so the daemon and the status
+// service cannot drift apart. The replace makes that work in a plain checkout,
+// with no workspace file needed.
+replace github.com/goravaa/chotu/status => ../status
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

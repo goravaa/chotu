@@ -37,7 +37,6 @@ func NewStore(db *sql.DB) *Store {
 	return &Store{db: db}
 }
 
-
 func GetMachine(db *sql.DB) (*Machine, error) {
 	var machine Machine
 

@@ -225,85 +225,233 @@ func TestRealGraphReportsActionableErrors(t *testing.T) {
 	}
 }
 
-// TestStorageTaskCreatesStateDirs proves the storage body does its work rather
-// than only reporting failure, using the environment override so the test needs
-// no root.
-func TestStorageTaskCreatesStateDirs(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "chotu-state")
+// testLayout points the layout at temporary directories so the storage bodies
+// can run without root or a real disk.
+func testLayout(t *testing.T) Layout {
+	t.Helper()
 
-	t.Setenv("CHOTU_STATE_DIR", dir)
-	t.Setenv("CHOTU_LOG_DIR", filepath.Join(dir, "log"))
+	root := t.TempDir()
 
-	if err := setupStorage(&config.Config{})(context.Background()); err != nil {
+	layout := Layout{
+		Mode:       "persistent",
+		DataDir:    filepath.Join(root, "data"),
+		RunUser:    "",
+		Home:       filepath.Join(root, "home"),
+		DockerRoot: filepath.Join(root, "docker"),
+		ModelCache: filepath.Join(root, "huggingface"),
+		StateDir:   filepath.Join(root, "state"),
+		Workspace:  filepath.Join(root, "workspace"),
+	}
+	layout.LogDir = filepath.Join(layout.StateDir, "log")
+
+	return layout
+}
+
+// TestStorageTaskCreatesDirs proves the storage body does its work rather than
+// only reporting failure, using temporary directories so the test needs no root.
+func TestStorageTaskCreatesDirs(t *testing.T) {
+	layout := testLayout(t)
+
+	if err := setupStorage(&config.Config{}, layout)(context.Background()); err != nil {
 		t.Fatalf("setupStorage: %v", err)
 	}
 
-	for _, want := range []string{dir, filepath.Join(dir, "log")} {
+	for _, want := range []string{layout.StateDir, layout.LogDir, layout.ModelCache} {
 		if _, err := os.Stat(want); err != nil {
 			t.Errorf("storage task did not create %s: %v", want, err)
 		}
 	}
 }
 
-// TestStorageTaskVerifiesThePersistentVolume covers the difference between a
-// directory the task may create and a disk that has to be attached by the
-// provisioner. Creating the path would make the task pass on a machine with no
-// persistent storage at all.
-func TestStorageTaskVerifiesThePersistentVolume(t *testing.T) {
-	t.Setenv("CHOTU_STATE_DIR", t.TempDir())
-	t.Setenv("CHOTU_LOG_DIR", t.TempDir())
+// TestStorageTaskRequiresTheInstanceStoreOnlyWhenEphemeral covers the storage
+// topology. A disposable spot machine has nothing but the instance store, so
+// the task must refuse to run without it: an unmounted /data would silently put
+// the workspace on the small root disk and lose it when the instance is
+// reclaimed. A persistent machine already has a root disk, so the instance
+// store is only scratch and its absence is not fatal.
+func TestStorageTaskRequiresTheInstanceStoreOnlyWhenEphemeral(t *testing.T) {
+	t.Run("ephemeral without the instance store fails", func(t *testing.T) {
+		layout := testLayout(t)
+		layout.Mode = "ephemeral"
+		layout.DataDir = filepath.Join(t.TempDir(), "not-attached")
 
-	persist := &config.Config{}
-	persist.Machine.Storage.Persist = true
+		// The directory existing but not being a mount is the dangerous case.
+		if err := os.MkdirAll(layout.DataDir, 0o755); err != nil {
+			t.Fatalf("create the data directory: %v", err)
+		}
 
-	missing := filepath.Join(t.TempDir(), "no-such-disk")
+		err := setupStorage(&config.Config{}, layout)(context.Background())
+		if err == nil {
+			t.Fatal("ephemeral mode with no instance store: want an error")
+		}
 
-	t.Setenv("CHOTU_DATA_DIR", missing)
+		if !strings.Contains(err.Error(), "instance store") {
+			t.Errorf("error = %q, want it to name the instance store", err)
+		}
+	})
 
-	err := setupStorage(persist)(context.Background())
-	if err == nil {
-		t.Fatal("persist with no volume attached: want an error")
+	t.Run("ephemeral with the instance store succeeds", func(t *testing.T) {
+		layout := testLayout(t)
+		layout.Mode = "ephemeral"
+
+		// The check is on a real mount, so a plain temporary directory will not
+		// do. Use an actual mount point if the test host has one.
+		mount := findTestMount(t)
+		if mount == "" {
+			t.Skip("no writable mount point available to stand in for the instance store")
+		}
+
+		layout.DataDir = mount
+
+		if err := setupStorage(&config.Config{}, layout)(context.Background()); err != nil {
+			t.Errorf("ephemeral mode with the instance store attached: %v", err)
+		}
+	})
+
+	t.Run("persistent does not require the instance store", func(t *testing.T) {
+		layout := testLayout(t)
+		layout.Mode = "persistent"
+		layout.DataDir = filepath.Join(t.TempDir(), "not-attached")
+
+		if err := os.MkdirAll(layout.DataDir, 0o755); err != nil {
+			t.Fatalf("create the data directory: %v", err)
+		}
+
+		if err := setupStorage(&config.Config{}, layout)(context.Background()); err != nil {
+			t.Errorf("persistent mode without the instance store: %v", err)
+		}
+	})
+}
+
+// findTestMount returns a writable mount point to stand in for the instance
+// store, or "" if the test host has none. The storage task only stats the path,
+// so the mount point itself is used rather than a directory inside it.
+func findTestMount(t *testing.T) string {
+	t.Helper()
+
+	for _, candidate := range []string{"/dev/shm", "/run"} {
+		mounted, err := isMountpoint(candidate)
+		if err != nil || !mounted {
+			continue
+		}
+
+		return candidate
 	}
 
-	if !strings.Contains(err.Error(), "persist") {
-		t.Errorf("error = %q, want it to name machine.storage.persist", err)
-	}
+	return ""
+}
 
-	present := t.TempDir()
+// TestResolveLayoutFollowsPersistence pins the storage topology to the config,
+// which is the whole point of machine.storage.persist: the same machine
+// topology has to be derived without any task hardcoding a path.
+func TestResolveLayoutFollowsPersistence(t *testing.T) {
+	t.Run("persistent keeps state on the root disk", func(t *testing.T) {
+		t.Setenv("CHOTU_DATA_DIR", "/mnt/instance-store")
+		t.Setenv("CHOTU_WORKSPACE_DIR", "")
+		t.Setenv("CHOTU_DOCKER_ROOT", "")
+		t.Setenv("CHOTU_MODEL_CACHE", "")
+		t.Setenv("CHOTU_STATE_DIR", "")
+		t.Setenv("CHOTU_LOG_DIR", "")
 
-	t.Setenv("CHOTU_DATA_DIR", present)
+		layout := ResolveLayout(&config.Config{
+			Machine: config.MachineConfig{
+				Storage: config.StorageConfig{Persist: true},
+			},
+		})
 
-	if err := setupStorage(persist)(context.Background()); err != nil {
-		t.Errorf("persist with the volume attached: %v", err)
-	}
+		if !layout.IsPersistent() {
+			t.Fatal("persist=true: want persistent mode")
+		}
 
-	// With persist off the task must not care about the data directory.
-	t.Setenv("CHOTU_DATA_DIR", missing)
+		if layout.RequiresDataDir() {
+			t.Error("persist=true: the instance store is scratch and must not be required")
+		}
 
-	if err := setupStorage(&config.Config{})(context.Background()); err != nil {
-		t.Errorf("persist disabled: %v", err)
-	}
+		// The instance store is still the data directory, it just is not where
+		// the workspace lives.
+		if layout.DataDir != "/mnt/instance-store" {
+			t.Errorf("DataDir = %q, want the instance store at /mnt/instance-store", layout.DataDir)
+		}
+
+		if layout.DockerRoot != "/var/lib/docker" {
+			t.Errorf("DockerRoot = %q, want the root disk at /var/lib/docker", layout.DockerRoot)
+		}
+
+		if !strings.HasPrefix(layout.ModelCache, "/var/lib/chotu") {
+			t.Errorf("ModelCache = %q, want the root disk under /var/lib/chotu", layout.ModelCache)
+		}
+
+		if !strings.HasSuffix(layout.Workspace, "/workspace") {
+			t.Errorf("Workspace = %q, want a workspace under the user's home", layout.Workspace)
+		}
+
+		if strings.HasPrefix(layout.Workspace, layout.DataDir) {
+			t.Errorf(
+				"Workspace = %q must not be on the instance store in persistent mode",
+				layout.Workspace,
+			)
+		}
+	})
+
+	t.Run("ephemeral puts everything on the instance store", func(t *testing.T) {
+		t.Setenv("CHOTU_DATA_DIR", "/mnt/instance-store")
+		t.Setenv("CHOTU_WORKSPACE_DIR", "")
+		t.Setenv("CHOTU_DOCKER_ROOT", "")
+		t.Setenv("CHOTU_MODEL_CACHE", "")
+		t.Setenv("CHOTU_STATE_DIR", "")
+		t.Setenv("CHOTU_LOG_DIR", "")
+
+		layout := ResolveLayout(&config.Config{})
+
+		if layout.IsPersistent() {
+			t.Fatal("persist=false: want ephemeral mode")
+		}
+
+		if !layout.RequiresDataDir() {
+			t.Error("persist=false: the instance store is the only storage and must be required")
+		}
+
+		for name, path := range map[string]string{
+			"Workspace":  layout.Workspace,
+			"DockerRoot": layout.DockerRoot,
+			"ModelCache": layout.ModelCache,
+			"StateDir":   layout.StateDir,
+		} {
+			if !strings.HasPrefix(path, "/mnt/instance-store") {
+				t.Errorf("%s = %q, want it on the instance store", name, path)
+			}
+		}
+	})
 }
 
 // TestDisabledFeaturesSucceed checks that features switched off in the config
 // are a no-op rather than a failure, since every task runs on every cycle.
 func TestDisabledFeaturesSucceed(t *testing.T) {
 	ctx := context.Background()
+	layout := testLayout(t)
 
-	if err := setupS3(&config.Config{})(ctx); err != nil {
+	if err := setupS3(&config.Config{}, layout)(ctx); err != nil {
 		t.Errorf("s3 with enabled=false: %v", err)
 	}
 
-	if err := setupS3(&config.Config{S3: config.S3Config{Enabled: true}})(ctx); err == nil {
+	if err := setupS3(&config.Config{S3: config.S3Config{Enabled: true}}, layout)(ctx); err == nil {
 		t.Error("s3 enabled with no bucket: want an error")
 	}
 
-	if err := setupOpenCode(&config.Config{})(ctx); err != nil {
+	if err := setupOpenCode(&config.Config{}, layout)(ctx); err != nil {
 		t.Errorf("opencode disabled: %v", err)
 	}
 
-	if err := setupTooling(&config.Config{})(ctx); err != nil {
+	if err := setupTooling(&config.Config{}, layout)(ctx); err != nil {
 		t.Errorf("tooling with no packages: %v", err)
+	}
+
+	if err := setupStatusPage(&config.Config{}, layout)(ctx); err != nil {
+		t.Errorf("status page disabled: %v", err)
+	}
+
+	if err := setupSync(&config.Config{}, layout)(ctx); err != nil {
+		t.Errorf("sync with s3 disabled: %v", err)
 	}
 }
 

@@ -1,25 +1,48 @@
+// Package status defines the machine status document that the setup daemon
+// produces and the status service serves.
+//
+// It lives in its own module because two deployables need it: chotu-setup
+// writes it, status-service reads it, and neither should own a copy. A
+// duplicated struct is a contract that silently drifts.
 package status
 
 import "time"
 
 type Status struct {
-	Timestamp  string     `json:"timestamp"`
+	// Timestamp is when this document was produced, in UTC.
+	Timestamp string `json:"timestamp"`
+
+	// Version is the chotu-setup build that produced it.
+	Version string `json:"version"`
+
+	// State is the machine state: INITIALIZING, READY or FAILED.
+	State string `json:"state"`
+
+	// Cycle counts the setup cycles completed by this daemon.
+	Cycle int `json:"cycle"`
+
 	Setup      Setup      `json:"setup"`
 	Monitoring Monitoring `json:"monitoring"`
+}
+
+// Setup reports the outcome of the setup task graph.
+type Setup struct {
+	// Tasks is keyed by task name, so a task added to the graph appears here
+	// without a change to this package.
+	Tasks map[string]ServiceStatus `json:"tasks"`
+
+	// Failed lists the tasks that did not complete, sorted, so the page can lead
+	// with what is broken.
+	Failed []string `json:"failed"`
+
+	// LastCycleDurationMS is how long the most recent cycle took. It is the
+	// number a user watches when the machine seems stuck.
+	LastCycleDurationMS int64 `json:"last_cycle_duration_ms"`
 }
 
 type ServiceStatus struct {
 	State   string `json:"state"`
 	Message string `json:"message"`
-}
-
-type Setup struct {
-	GPU      ServiceStatus `json:"gpu"`
-	Docker   ServiceStatus `json:"docker"`
-	VLLM     ServiceStatus `json:"vllm"`
-	OpenCode ServiceStatus `json:"opencode"`
-	Rclone   ServiceStatus `json:"rclone"`
-	S3       ServiceStatus `json:"s3"`
 }
 
 type Monitoring struct {
@@ -68,8 +91,16 @@ type OpenCodeSession struct {
 	LastUsed string `json:"last_used"`
 }
 
-func NewStatus() *Status {
+func New() *Status {
 	return &Status{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Setup: Setup{
+			Tasks:  map[string]ServiceStatus{},
+			Failed: []string{},
+		},
+		Monitoring: Monitoring{
+			Disks:            []Disk{},
+			OpenCodeSessions: []OpenCodeSession{},
+		},
 	}
 }

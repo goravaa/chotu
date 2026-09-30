@@ -300,3 +300,6 @@ notes/notes.md
 
 chotu-status
 chotu-service
+
+# The compiled daemon, built in place by chotu-setup/makefile.
+chotu-setup/chotu-setup
