@@ -1,0 +1,23 @@
+[Unit]
+Description=Chotu setup service
+Documentation=https://github.com/goravaa/chotu
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/chotu-setup \
+  -config /etc/chotu/config.yaml \
+  -db /var/lib/chotu/chotu.db \
+  -interval 60s \
+  -attempts 3 \
+  -retry-delay 2s
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
