@@ -5,7 +5,8 @@ readonly CHOTU_BOOTSTRAP_VERSION="0.1.0"
 readonly CHOTU_SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 readonly CHOTU_CONFIG_RESOLVER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/resolve_config.py"
 readonly CHOTU_DEFAULT_CONFIG="/etc/chotu/config.yaml"
-readonly CHOTU_REPO_CONFIG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.yaml"
+readonly CHOTU_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly CHOTU_REPO_CONFIG="${CHOTU_REPO_ROOT}/config.yaml"
 readonly CHOTU_BOOTSTRAP_DIR="/var/lib/chotu/bootstrap"
 readonly CHOTU_RESOLVED_CONFIG="${CHOTU_BOOTSTRAP_DIR}/config.resolved"
 readonly CHOTU_STATE_DIR="${CHOTU_BOOTSTRAP_DIR}/stages"
@@ -536,6 +537,18 @@ EOF
   log "Chotu status service enabled on port ${CHOTU_STATUS_PORT}"
 }
 
+install_chotu_setup() {
+  local installer="${CHOTU_REPO_ROOT}/chotu-setup/deploy/install.sh"
+
+  if [[ ! -f "${installer}" ]]; then
+    die "chotu-setup installer not found at ${installer}"
+  fi
+
+  log "Installing and starting the Chotu setup service"
+  "${installer}"
+  systemctl is-active --quiet chotu-setup.service || die "chotu-setup.service is not active"
+}
+
 final_verification() {
   nvidia-smi >/dev/null || die "Final verification failed: nvidia-smi"
   docker info >/dev/null || die "Final verification failed: docker"
@@ -543,6 +556,7 @@ final_verification() {
   curl -fsS "http://127.0.0.1:${CHOTU_INFERENCE_PORT}/v1/models" >/dev/null || die "Final verification failed: vLLM API"
   [[ -f "${CHOTU_WORKSPACE}/opencode.json" ]] || die "Final verification failed: opencode config missing"
   systemctl is-active --quiet chotu-status.service || die "Final verification failed: status service"
+  systemctl is-active --quiet chotu-setup.service || die "Final verification failed: chotu-setup service"
   clear_resume_service
   log "Chotu bootstrap complete"
 }
@@ -564,6 +578,7 @@ main() {
   install_opencode
   configure_sync_services
   configure_chotu_status
+  install_chotu_setup
   final_verification
 }
 
