@@ -38,7 +38,7 @@ func TestRunnerDependencies(t *testing.T) {
 		},
 	}
 
-	runner := NewRunner(tasks)
+	runner := NewRunner(tasks, nil)
 
 	results := runner.Run(context.Background())
 
@@ -82,7 +82,7 @@ func TestRunnerDependencyFailure(t *testing.T) {
 		},
 	}
 
-	runner := NewRunner(tasks)
+	runner := NewRunner(tasks, nil)
 
 	results := runner.Run(context.Background())
 

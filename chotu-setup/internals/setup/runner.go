@@ -12,7 +12,7 @@ type TaskResult struct {
 }
 
 type TaskStateStore interface {
-	SetTaskState(name string, state TaskState, err error) error
+	SetTaskState(name string, state string, err error) error
 }
 
 type Runner struct {
@@ -111,7 +111,7 @@ func (r *Runner) updateTaskState(
 		return nil
 	}
 
-	return r.store.SetTaskState(name, state, err)
+	return r.store.SetTaskState(name, string(state), err)
 }
 
 func (r *Runner) waitForDependencies(
