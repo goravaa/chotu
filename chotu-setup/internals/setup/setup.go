@@ -14,5 +14,7 @@ const (
 type Task struct {
 	Name         string
 	Dependencies []string
-	Run          func(context.Context) error
+	// Retries overrides the runner's attempt count for this task when > 0.
+	Retries int
+	Run     func(context.Context) error
 }
