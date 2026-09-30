@@ -17,6 +17,11 @@ const (
 	StateFailed       MachineState = "FAILED"
 )
 
+const (
+	taskStateRunning   = "RUNNING"
+	taskStateCompleted = "COMPLETED"
+)
+
 type Machine struct {
 	State      MachineState
 	ConfigHash string
@@ -117,6 +122,16 @@ func (s *Store) SetTaskState(
 		errMessage = &msg
 	}
 
+	startedAt := any(nil)
+	if taskState == taskStateRunning {
+		startedAt = now
+	}
+
+	completedAt := any(nil)
+	if taskState == taskStateCompleted {
+		completedAt = now
+	}
+
 	_, err := s.db.Exec(`
 		INSERT INTO setup_tasks (
 			name,
@@ -144,8 +159,8 @@ func (s *Store) SetTaskState(
 	`,
 		name,
 		taskState,
-		nil,
-		nil,
+		startedAt,
+		completedAt,
 		errMessage,
 		now,
 	)
