@@ -2,11 +2,16 @@ package setup
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/goravaa/chotu/chotu-setup/internals/state"
 )
 
 func TestRunnerDependencies(t *testing.T) {
@@ -315,5 +320,283 @@ func TestRunnerRetryStopsOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("runner did not stop after context cancellation")
+	}
+}
+
+func TestRunnerNilRunIsReportedAsFailure(t *testing.T) {
+	tasks := []*Task{
+		{Name: "has-no-body"},
+		{
+			Name:         "after",
+			Dependencies: []string{"has-no-body"},
+			Run:          func(context.Context) error { return nil },
+		},
+	}
+
+	results := NewRunner(tasks, nil).
+		WithRetryPolicy(1, time.Millisecond).
+		Run(context.Background())
+
+	if results["has-no-body"].State != Failed {
+		t.Fatalf("has-no-body = %s, want FAILED", results["has-no-body"].State)
+	}
+
+	if results["after"].State != Failed {
+		t.Fatalf("after = %s, want FAILED", results["after"].State)
+	}
+}
+
+func TestRunnerRetryBackoffGrows(t *testing.T) {
+	tasks := []*Task{
+		{
+			Name: "always-fails",
+			Run:  func(context.Context) error { return errors.New("nope") },
+		},
+	}
+
+	started := time.Now()
+
+	NewRunner(tasks, nil).
+		WithRetryPolicy(3, 20*time.Millisecond).
+		Run(context.Background())
+
+	elapsed := time.Since(started)
+
+	// Linear backoff would sleep 20ms + 20ms; exponential sleeps 20ms + 40ms.
+	if elapsed < 60*time.Millisecond {
+		t.Errorf("elapsed = %s, want at least 60ms for exponential backoff", elapsed)
+	}
+
+	if elapsed > 5*time.Second {
+		t.Errorf("elapsed = %s, backoff is far too long", elapsed)
+	}
+}
+
+// A store that always fails must not change the outcome of the run: the
+// setup still executes and the results are still correct.
+type failingStore struct {
+	calls int32
+}
+
+func (f *failingStore) SetTaskState(string, string, error) error {
+	atomic.AddInt32(&f.calls, 1)
+
+	return errors.New("state database is down")
+}
+
+func TestRunnerSurvivesStoreFailure(t *testing.T) {
+	store := &failingStore{}
+
+	var ran int32
+
+	tasks := []*Task{
+		{
+			Name: "ok",
+			Run: func(context.Context) error {
+				atomic.AddInt32(&ran, 1)
+				return nil
+			},
+		},
+		{
+			Name: "broken",
+			Run:  func(context.Context) error { return errors.New("nope") },
+		},
+	}
+
+	results := NewRunner(tasks, store).
+		WithRetryPolicy(1, time.Millisecond).
+		Run(context.Background())
+
+	if results["ok"].State != Completed {
+		t.Errorf("ok = %s", results["ok"].State)
+	}
+
+	if results["broken"].State != Failed {
+		t.Errorf("broken = %s", results["broken"].State)
+	}
+
+	if atomic.LoadInt32(&ran) != 1 {
+		t.Errorf("task ran %d times, want 1", ran)
+	}
+
+	// Running then final state per task.
+	if got := atomic.LoadInt32(&store.calls); got != 4 {
+		t.Errorf("store calls = %d, want 4", got)
+	}
+}
+
+func runnerTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+
+	db, err := state.Open(filepath.Join(t.TempDir(), "chotu.db"))
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	t.Cleanup(func() { db.Close() })
+
+	return db
+}
+
+func persistedStates(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+
+	rows, err := db.Query(`
+		SELECT name, state FROM setup_tasks ORDER BY name
+	`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	states := map[string]string{}
+
+	for rows.Next() {
+		var name, taskState string
+
+		if err := rows.Scan(&name, &taskState); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+
+		states[name] = taskState
+	}
+
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	return states
+}
+
+func TestRunnerPersistsTaskStates(t *testing.T) {
+	db := runnerTestDB(t)
+
+	tasks := []*Task{
+		{Name: "storage", Run: func(context.Context) error { return nil }},
+		{Name: "docker", Run: func(context.Context) error { return nil }},
+		{
+			Name:         "docker-gpu",
+			Dependencies: []string{"docker"},
+			Run:          func(context.Context) error { return nil },
+		},
+	}
+
+	NewRunner(tasks, state.NewStore(db)).
+		WithRetryPolicy(1, time.Millisecond).
+		Run(context.Background())
+
+	want := map[string]string{
+		"storage":    "COMPLETED",
+		"docker":     "COMPLETED",
+		"docker-gpu": "COMPLETED",
+	}
+
+	got := persistedStates(t, db)
+
+	if len(got) != len(want) {
+		t.Fatalf("persisted %v, want %v", got, want)
+	}
+
+	for name, wantState := range want {
+		if got[name] != wantState {
+			t.Errorf("%s = %s, want %s", name, got[name], wantState)
+		}
+	}
+}
+
+func TestRunnerPersistsFailureAndSkippedDependency(t *testing.T) {
+	db := runnerTestDB(t)
+
+	tasks := []*Task{
+		{
+			Name: "boom",
+			Run:  func(context.Context) error { return errors.New("kaboom") },
+		},
+		{
+			Name:         "dependent",
+			Dependencies: []string{"boom"},
+			Run:          func(context.Context) error { return nil },
+		},
+		{Name: "independent", Run: func(context.Context) error { return nil }},
+	}
+
+	NewRunner(tasks, state.NewStore(db)).
+		WithRetryPolicy(1, time.Millisecond).
+		Run(context.Background())
+
+	rows, err := db.Query(`
+		SELECT name, state, COALESCE(error, '')
+		FROM setup_tasks
+		ORDER BY name
+	`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	got := map[string][2]string{}
+
+	for rows.Next() {
+		var name, taskState, taskErr string
+
+		if err := rows.Scan(&name, &taskState, &taskErr); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+
+		got[name] = [2]string{taskState, taskErr}
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("persisted %d rows, want 3: %v", len(got), got)
+	}
+
+	if got["boom"][0] != "FAILED" || got["boom"][1] != "kaboom" {
+		t.Errorf("boom = %v", got["boom"])
+	}
+
+	wantDep := `dependency "boom" for task "dependent" did not complete`
+	if got["dependent"][0] != "FAILED" || got["dependent"][1] != wantDep {
+		t.Errorf("dependent = %v, want %v", got["dependent"], wantDep)
+	}
+
+	if got["independent"][0] != "COMPLETED" {
+		t.Errorf("independent = %v", got["independent"])
+	}
+}
+
+// TestRunnerPersistsEveryTaskUnderConcurrency is a regression test for the
+// state database being written from many goroutines at once.
+func TestRunnerPersistsEveryTaskUnderConcurrency(t *testing.T) {
+	db := runnerTestDB(t)
+
+	const count = 30
+
+	var tasks []*Task
+
+	for i := range count {
+		tasks = append(tasks, &Task{
+			Name: fmt.Sprintf("task-%02d", i),
+			Run:  func(context.Context) error { return nil },
+		})
+	}
+
+	results := NewRunner(tasks, state.NewStore(db)).
+		WithRetryPolicy(1, time.Millisecond).
+		Run(context.Background())
+
+	if len(results) != count {
+		t.Fatalf("results = %d, want %d", len(results), count)
+	}
+
+	states := persistedStates(t, db)
+
+	if len(states) != count {
+		t.Fatalf("persisted %d / %d rows", len(states), count)
+	}
+
+	for name, taskState := range states {
+		if taskState != "COMPLETED" {
+			t.Errorf("%s = %s, want COMPLETED", name, taskState)
+		}
 	}
 }
