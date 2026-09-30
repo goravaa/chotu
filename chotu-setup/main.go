@@ -100,6 +100,7 @@ func run() int {
 			ctx,
 			db,
 			*configPath,
+			setup.Tasks(),
 			*attempts,
 			*retryDelay,
 		)
@@ -115,13 +116,22 @@ func run() int {
 		return 0
 	}
 
-	return runDaemon(ctx, db, *configPath, *interval, *attempts, *retryDelay)
+	return runDaemon(
+		ctx,
+		db,
+		*configPath,
+		setup.Tasks(),
+		*interval,
+		*attempts,
+		*retryDelay,
+	)
 }
 
 func runDaemon(
 	ctx context.Context,
 	db *sql.DB,
 	configPath string,
+	tasks []*setup.Task,
 	interval time.Duration,
 	attempts int,
 	retryDelay time.Duration,
@@ -144,6 +154,7 @@ func runDaemon(
 			ctx,
 			db,
 			configPath,
+			tasks,
 			attempts,
 			retryDelay,
 		); err != nil {
@@ -169,6 +180,7 @@ func runCycle(
 	ctx context.Context,
 	db *sql.DB,
 	configPath string,
+	tasks []*setup.Task,
 	attempts int,
 	retryDelay time.Duration,
 ) ([]string, error) {
@@ -207,7 +219,7 @@ func runCycle(
 		return nil, err
 	}
 
-	runner := setup.NewRunner(setup.Tasks(), state.NewStore(db)).
+	runner := setup.NewRunner(tasks, state.NewStore(db)).
 		WithRetryPolicy(attempts, retryDelay)
 
 	results := runner.Run(ctx)
