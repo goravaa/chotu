@@ -98,7 +98,7 @@ func run() int {
 		log.Printf("open state database: %v", err)
 		return 1
 	}
-	defer db.Close()
+	defer db.Close() //nolint:errcheck // main cannot report it; the process is exiting
 
 	log.Printf(
 		"chotu-setup %s starting: config=%s db=%s interval=%s once=%t attempts=%d retry-delay=%s",

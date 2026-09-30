@@ -602,12 +602,16 @@ func runTasks(t *testing.T, tasks []*Task) map[string]TaskResult {
 	return nil
 }
 
-func assertAll(t *testing.T, results map[string]TaskResult, want TaskState) {
+// assertAllCompleted fails unless every task in the map completed. The
+// expected state is part of the name rather than a parameter because every
+// caller wants COMPLETED: a caller that wanted anything else should be
+// asserting on that one task directly, where a failure is readable.
+func assertAllCompleted(t *testing.T, results map[string]TaskResult) {
 	t.Helper()
 
 	for name, result := range results {
-		if result.State != want {
-			t.Errorf("%s = %s, want %s (%v)", name, result.State, want, result.Error)
+		if result.State != Completed {
+			t.Errorf("%s = %s, want %s (%v)", name, result.State, Completed, result.Error)
 		}
 	}
 }
@@ -617,7 +621,7 @@ func TestBodiedTasksRunInDependencyOrder(t *testing.T) {
 
 	results := runTasks(t, f.tasks())
 
-	assertAll(t, results, Completed)
+	assertAllCompleted(t, results)
 
 	// Ordering is proven by data flow, not timestamps: report can only be
 	// written after verify consumed probe's output.
@@ -656,7 +660,7 @@ func TestBodiedTasksAreIdempotent(t *testing.T) {
 			WithRetryPolicy(1, time.Millisecond).
 			Run(context.Background())
 
-		assertAll(t, results, Completed)
+		assertAllCompleted(t, results)
 
 		if f.execs.Load() != int32(cycle+1) {
 			t.Fatalf("cycle %d: uname ran %d times", cycle+1, f.execs.Load())
@@ -668,7 +672,7 @@ func TestBodiedTasksAreIdempotent(t *testing.T) {
 		t.Fatalf("persisted %v, want 4 rows after 3 cycles", states)
 	}
 
-	assertAll(t, resultsOf(states), Completed)
+	assertAllCompleted(t, resultsOf(states))
 
 	// A failed cycle must heal on the next one.
 	f.healthy = false
@@ -687,7 +691,7 @@ func TestBodiedTasksAreIdempotent(t *testing.T) {
 		WithRetryPolicy(1, time.Millisecond).
 		Run(context.Background())
 
-	assertAll(t, recovered, Completed)
+	assertAllCompleted(t, recovered)
 }
 
 func resultsOf(states map[string]string) map[string]TaskResult {
@@ -707,7 +711,7 @@ func TestBodiedTaskDetectsServiceDrift(t *testing.T) {
 	f := newFixture(t)
 	tasks := f.tasks()
 
-	assertAll(t, runTasks(t, tasks), Completed)
+	assertAllCompleted(t, runTasks(t, tasks))
 
 	// The service dies after setup completed.
 	f.setServiceRunning(false)
@@ -738,7 +742,7 @@ func TestBodiedTaskDetectsServiceDrift(t *testing.T) {
 	// The service comes back and the next cycle is healthy again.
 	f.setServiceRunning(true)
 
-	assertAll(t, runTasks(t, tasks), Completed)
+	assertAllCompleted(t, runTasks(t, tasks))
 }
 
 // Two independent tasks must overlap in wall-clock time. The rendezvous makes
@@ -767,7 +771,7 @@ func TestIndependentBodiedTasksRunInParallel(t *testing.T) {
 		{Name: "second", Run: body},
 	}
 
-	assertAll(t, runTasks(t, tasks), Completed)
+	assertAllCompleted(t, runTasks(t, tasks))
 
 	if arrived.Load() != 2 {
 		t.Errorf("arrivals = %d, want 2", arrived.Load())

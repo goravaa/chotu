@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/goravaa/chotu/status"
@@ -25,7 +26,14 @@ func (h *StatusHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 	current := h.store.Get()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(current)
+
+	// The only realistic failure is the client disconnecting mid-body, in which
+	// case the response is already truncated and there is nothing to salvage.
+	// Logging it is still worth it: a client polling hard enough to trip this
+	// is a client worth knowing about.
+	if err := json.NewEncoder(w).Encode(current); err != nil {
+		log.Printf("[status] could not write the status document: %v", err)
+	}
 }
 
 // UpdateStatus receives the document the setup daemon publishes after each

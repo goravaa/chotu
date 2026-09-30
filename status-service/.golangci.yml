@@ -1,0 +1,39 @@
+# Lint policy for the Chotu Go services.
+#
+# The defaults are deliberately close to what `go vet` already catches. Anything
+# switched off here has a reason, and the reason is in the comment beside it.
+#
+# Written for golangci-lint v2.
+
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - ineffassign
+    - unconvert
+    - unparam
+
+  exclusions:
+    rules:
+      # An unchecked Close in a test is not a bug: the assertion either passed
+      # or the process is about to exit. Production code is held to the default,
+      # so a dropped database handle or a leaked lock file is still caught there.
+      #
+      # This matters most for *sql.Rows, where checking the deferred Close would
+      # mean a closure per call site to catch an error nobody can act on. The
+      # check that does matter, rows.Err(), is asserted separately at every site.
+      - path: _test\.go
+        linters:
+          - errcheck
+        text: "Error return value of .*Close. is not checked"
+
+formatters:
+  enable:
+    - gofmt

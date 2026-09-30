@@ -546,6 +546,10 @@ func TestRunnerPersistsFailureAndSkippedDependency(t *testing.T) {
 		got[name] = [2]string{taskState, taskErr}
 	}
 
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
 	if len(got) != 3 {
 		t.Fatalf("persisted %d rows, want 3: %v", len(got), got)
 	}

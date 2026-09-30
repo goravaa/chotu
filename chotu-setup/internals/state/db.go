@@ -26,12 +26,16 @@ func Open(path string) (*sql.DB, error) {
 	db.SetMaxIdleConns(1)
 
 	if err := db.Ping(); err != nil {
-		db.Close()
+		// The handle is being discarded, so a close failure would only mask the
+		// error the caller actually needs to see.
+		_ = db.Close()
+
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
 	if err := migrate(db); err != nil {
-		db.Close()
+		_ = db.Close()
+
 		return nil, fmt.Errorf("migrate database: %w", err)
 	}
 

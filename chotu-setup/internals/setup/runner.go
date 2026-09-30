@@ -81,8 +81,6 @@ func (r *Runner) Run(ctx context.Context) map[string]TaskResult {
 	}
 
 	for _, task := range r.tasks {
-		task := task
-
 		wg.Add(1)
 
 		go func() {
@@ -195,7 +193,7 @@ func (r *Runner) runWithRetries(ctx context.Context, task *Task) error {
 		}
 
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("%w (last error: %v)", ctxErr, err)
+			return fmt.Errorf("%w (last error: %w)", ctxErr, err)
 		}
 
 		if attempt >= attempts {
@@ -220,7 +218,7 @@ func (r *Runner) runWithRetries(ctx context.Context, task *Task) error {
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%w (last error: %v)", ctx.Err(), err)
+			return fmt.Errorf("%w (last error: %w)", ctx.Err(), err)
 		case <-time.After(delay):
 		}
 

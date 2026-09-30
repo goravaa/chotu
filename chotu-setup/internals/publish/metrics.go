@@ -19,7 +19,7 @@ func collectCPU(previous *cpuCounters) (status.CPU, *cpuCounters) {
 	if err != nil {
 		return status.CPU{}, previous
 	}
-	defer file.Close()
+	defer file.Close() //nolint:errcheck // read-only handle, nothing to report
 
 	scanner := bufio.NewScanner(file)
 
@@ -111,10 +111,15 @@ func collectRAM() status.RAM {
 		return status.RAM{}
 	}
 
-	used := total - available
-	if used < 0 {
-		used = 0
+	// Compare before subtracting. On an unsigned type an underflow wraps to
+	// roughly 1.8e19, which would publish a memory usage figure in the
+	// quintillions, so the guard has to be on the operands rather than on the
+	// result.
+	if available >= total {
+		available = total
 	}
+
+	used := total - available
 
 	return status.RAM{
 		UsedBytes:    used,

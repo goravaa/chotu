@@ -1,13 +1,14 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 )
 
 func Page(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	w.Write([]byte(`
+	page := `
 <!DOCTYPE html>
 <html>
 <head>
@@ -34,5 +35,11 @@ func Page(w http.ResponseWriter, r *http.Request) {
 	</script>
 </body>
 </html>
-`))
+`
+
+	// A write failure here means the browser went away before the page finished
+	// arriving, which is not worth failing over.
+	if _, err := w.Write([]byte(page)); err != nil {
+		log.Printf("[page] could not write the page: %v", err)
+	}
 }

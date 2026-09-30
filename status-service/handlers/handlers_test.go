@@ -321,6 +321,51 @@ func TestPageRenders(t *testing.T) {
 	}
 }
 
+// TestEventsWithoutAFlusherDoesNotPanic covers the case that used to crash. The
+// handler asserted w.(http.Flusher) inline, which panics on any ResponseWriter
+// that does not implement it, so a wrapping middleware would take down every
+// event stream with a stack trace instead of one clear error.
+func TestEventsWithoutAFlusherDoesNotPanic(t *testing.T) {
+	store := &internals.StatusStore{}
+	hub := internals.NewStatusHub()
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
+
+	// plainWriter is an http.ResponseWriter with no Flush method, which is what
+	// a bare wrapper hands over.
+	plain := &plainWriter{header: http.Header{}}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("Events panicked instead of reporting the problem: %v", recovered)
+		}
+	}()
+
+	NewEventHandler(store, hub).Events(plain, request)
+
+	if plain.code != http.StatusInternalServerError {
+		t.Errorf("code = %d, want 500 for a connection that cannot stream", plain.code)
+	}
+}
+
+// plainWriter is a ResponseWriter with no Flush method.
+type plainWriter struct {
+	header http.Header
+	code   int
+}
+
+func (w *plainWriter) Header() http.Header { return w.header }
+
+func (w *plainWriter) Write(body []byte) (int, error) {
+	if w.code == 0 {
+		w.code = http.StatusOK
+	}
+
+	return len(body), nil
+}
+
+func (w *plainWriter) WriteHeader(code int) { w.code = code }
+
 // readEvent reads one SSE frame.
 func readEvent(reader *bufio.Reader) (status.Status, error) {
 	var document status.Status

@@ -30,7 +30,7 @@ const dpkgLockPath = "/var/lib/dpkg/lock-frontend"
 
 // withAptLock runs fn while holding both the in-process mutex and the dpkg lock
 // file, so concurrent Chotu tasks and anything else on the machine take turns.
-func withAptLock(ctx context.Context, fn func() error) error {
+func withAptLock(fn func() error) error {
 	aptLock.Lock()
 	defer aptLock.Unlock()
 
@@ -47,7 +47,9 @@ func withAptLock(ctx context.Context, fn func() error) error {
 		return fn()
 	}
 
-	defer lock.Close()
+	// The lock is released by the deferred unlock below; a close failure on a
+	// lock file we are about to drop anyway has nothing useful to report.
+	defer lock.Close() //nolint:errcheck // releasing a lock file we are dropping
 
 	// Wait rather than fail: another package manager may simply be mid-install.
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
@@ -84,7 +86,7 @@ func aptPackagesMissing(pkgs []string) []string {
 
 // aptUpdate refreshes the package index.
 func aptUpdate(ctx context.Context) error {
-	return withAptLock(ctx, func() error {
+	return withAptLock(func() error {
 		runCtx, cancel := context.WithTimeout(ctx, aptTimeout)
 		defer cancel()
 
@@ -107,7 +109,7 @@ func aptInstall(ctx context.Context, pkgs ...string) error {
 
 	log.Printf("[apt] installing %s", strings.Join(missing, ", "))
 
-	return withAptLock(ctx, func() error {
+	return withAptLock(func() error {
 		runCtx, cancel := context.WithTimeout(ctx, aptTimeout)
 		defer cancel()
 
@@ -164,7 +166,7 @@ func aptRepo(ctx context.Context, name, keyURL, keyring, listURL string) (bool, 
 
 	added := false
 
-	err := withAptLock(ctx, func() error {
+	err := withAptLock(func() error {
 		runCtx, cancel := context.WithTimeout(ctx, aptTimeout)
 		defer cancel()
 

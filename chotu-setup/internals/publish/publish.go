@@ -90,6 +90,7 @@ func (p *Publisher) Publish(ctx context.Context, document status.Status) {
 		return
 	}
 
+	//nolint:errcheck // a read-only response body has no close error worth reporting
 	defer response.Body.Close()
 	// The body has to be drained for the connection to be reusable, though this
 	// transport disables keep-alives, so reading and discarding is enough.
