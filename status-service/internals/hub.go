@@ -49,8 +49,20 @@ func (h *StatusHub) Broadcast(status status.Status) {
 		select {
 		case client <- status:
 		default:
-			// Don't block the status update if a client
-			// hasn't consumed the previous update yet.
+			// If the client's channel is full, drain the stale update
+			// so they get the most recent one instead.
+			select {
+			case <-client:
+			default:
+			}
+
+			// Try sending again. It could still block if the client just
+			// drained it and the channel filled up, but in practice this
+			// replaces the old status with the new one.
+			select {
+			case client <- status:
+			default:
+			}
 		}
 	}
 }

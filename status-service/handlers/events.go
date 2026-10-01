@@ -60,6 +60,7 @@ func (h *EventHandler) Events(w http.ResponseWriter, r *http.Request) {
 				// and more reliable signal that there is nobody left to read.
 				return
 			}
+			log.Printf("[events] 6. Connected SSE client notified, cycle: %d", update.Cycle)
 
 		case <-r.Context().Done():
 			return
