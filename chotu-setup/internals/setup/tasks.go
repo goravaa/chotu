@@ -25,7 +25,6 @@ const (
 	TaskWorkspace = "workspace"
 	TaskOpenCode  = "opencode"
 	TaskVLLM      = "vllm"
-	TaskStatus    = "status"
 	TaskSync      = "sync"
 )
 
@@ -37,7 +36,6 @@ const (
 	defaultNvidiaDriverPackage = "nvidia-driver-580-server"
 
 	dockerContainerName = "chotu-vllm"
-	statusContainerName = "chotu-status"
 )
 
 // nvidiaDriverPackage returns the driver package to install and the matching
