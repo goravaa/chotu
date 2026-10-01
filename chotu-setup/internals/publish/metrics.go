@@ -46,6 +46,9 @@ func collectCPU(previous *cpuCounters) (status.CPU, *cpuCounters) {
 
 		return status.CPU{UsagePercent: usage}, &now
 	}
+	if err := scanner.Err(); err != nil {
+		return status.CPU{}, previous
+	}
 
 	return status.CPU{}, previous
 }
