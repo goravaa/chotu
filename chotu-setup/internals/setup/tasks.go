@@ -3,7 +3,7 @@ package setup
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -139,7 +139,13 @@ func run(ctx context.Context, name string, args ...string) (string, error) {
 }
 
 func execOutputCtx(ctx context.Context, name string, args ...string) (string, error) {
+	slog.Debug("executing command", "command", name, "args", args)
 	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err != nil {
+		slog.Debug("command failed", "command", name, "error", err, "output", string(out))
+	} else {
+		slog.Debug("command succeeded", "command", name)
+	}
 
 	trimmed := strings.TrimSpace(string(out))
 
@@ -188,16 +194,13 @@ func setupMachine(cfg *config.Config) func(context.Context) error {
 			return fmt.Errorf("unsupported operating system %q: Chotu targets Ubuntu", id)
 		}
 
-		log.Printf("[machine] %s %s %s", id, version, arch())
+		slog.Info(fmt.Sprintf("%s %s %s", id, version, arch()), "component", "machine")
 
 		if major, _, _ := strings.Cut(version, "."); major != expectedUbuntuMajor {
-			log.Printf(
-				"[machine] WARNING: expected Ubuntu %s, found %s. machine.image_id in the "+
-					"config has to point at an Ubuntu %s AMI",
-				expectedUbuntuMajor,
+			slog.Info(fmt.Sprintf("[machine] WARNING: expected Ubuntu %s, found %s. machine.image_id in the "+
+				"config has to point at an Ubuntu %s AMI", expectedUbuntuMajor,
 				version,
-				expectedUbuntuMajor,
-			)
+				expectedUbuntuMajor))
 		}
 
 		if arch() != "x86_64" {
@@ -277,11 +280,8 @@ func setupStorage(cfg *config.Config, layout Layout) func(context.Context) error
 				layout.DataDir,
 			)
 		} else if !mounted {
-			log.Printf(
-				"[storage] %s is not a mount point; continuing because the root disk is the "+
-					"primary storage in persistent mode",
-				layout.DataDir,
-			)
+			slog.Info(fmt.Sprintf("[storage] %s is not a mount point; continuing because the root disk is the "+
+				"primary storage in persistent mode", layout.DataDir))
 		}
 
 		for _, dir := range []string{layout.StateDir, layout.LogDir, layout.ModelCache} {
@@ -295,14 +295,11 @@ func setupStorage(cfg *config.Config, layout Layout) func(context.Context) error
 			return fmt.Errorf("check storage for %s: %w", layout.StateDir, err)
 		}
 
-		log.Printf("[storage] state filesystem:\n%s", usage)
+		slog.Info(fmt.Sprintf("state filesystem:\n%s", usage), "component", "storage")
 
 		if cfg != nil && cfg.Machine.Storage.RootDiskSizeGB > 0 {
-			log.Printf(
-				"[storage] configured root disk: %d GB %s",
-				cfg.Machine.Storage.RootDiskSizeGB,
-				cfg.Machine.Storage.RootDiskType,
-			)
+			slog.Info(fmt.Sprintf("configured root disk: %d GB %s", cfg.Machine.Storage.RootDiskSizeGB,
+				cfg.Machine.Storage.RootDiskType), "component", "storage")
 		}
 
 		return nil
@@ -325,7 +322,7 @@ func setupDocker(_ *config.Config, layout Layout) func(context.Context) error {
 		}
 
 		if !unitRunning(ctx, "docker") {
-			log.Printf("[docker] starting the daemon")
+			slog.Info("starting the daemon", "component", "docker")
 
 			if _, err := run(ctx, "systemctl", "enable", "--now", "docker"); err != nil {
 				return fmt.Errorf("start docker: %w", err)
@@ -337,7 +334,7 @@ func setupDocker(_ *config.Config, layout Layout) func(context.Context) error {
 			// A daemon that was just reconfigured needs a moment before it
 			// answers, so retry briefly rather than failing the cycle.
 			if restarted, restartErr := run(ctx, "systemctl", "restart", "docker"); restartErr == nil {
-				log.Printf("[docker] restarted the daemon: %s", restarted)
+				slog.Info(fmt.Sprintf("restarted the daemon: %s", restarted), "component", "docker")
 
 				version, err = run(ctx, "docker", "version", "--format", "{{.Server.Version}}")
 			}
@@ -351,7 +348,7 @@ func setupDocker(_ *config.Config, layout Layout) func(context.Context) error {
 			return err
 		}
 
-		log.Printf("[docker] healthy, server version %s, root %s", version, layout.DockerRoot)
+		slog.Info(fmt.Sprintf("healthy, server version %s, root %s", version, layout.DockerRoot), "component", "docker")
 
 		return nil
 	}
@@ -455,7 +452,7 @@ func writeDockerDaemonConfig(layout Layout) error {
 	}
 
 	if wrote {
-		log.Printf("[docker] wrote /etc/docker/daemon.json (data-root %s)", layout.DockerRoot)
+		slog.Info(fmt.Sprintf("wrote /etc/docker/daemon.json (data-root %s)", layout.DockerRoot), "component", "docker")
 	}
 
 	return nil
@@ -512,11 +509,8 @@ func ensureUserInGroups(layout Layout, groups ...string) error {
 		return fmt.Errorf("add %s to the %s group(s): %w", layout.RunUser, strings.Join(missing, ", "), err)
 	}
 
-	log.Printf(
-		"[groups] added %s to %s; they apply on the next login",
-		layout.RunUser,
-		strings.Join(missing, ", "),
-	)
+	slog.Info(fmt.Sprintf("added %s to %s; they apply on the next login", layout.RunUser,
+		strings.Join(missing, ", ")), "component", "groups")
 
 	return nil
 }
@@ -568,7 +562,7 @@ func setupGPU(_ *config.Config, layout Layout) func(context.Context) error {
 
 		for _, line := range strings.Split(out, "\n") {
 			if line = strings.TrimSpace(line); line != "" {
-				log.Printf("[gpu] %s", line)
+				slog.Info(line, "component", "gpu")
 			}
 		}
 
@@ -602,13 +596,13 @@ func installNvidiaStack(ctx context.Context, layout Layout) error {
 	}
 
 	if needsDriver {
-		log.Printf("[gpu] installing %s", driver)
+		slog.Info(fmt.Sprintf("installing %s", driver), "component", "gpu")
 
 		// Headers let the driver build its kernel module against the running
 		// kernel. Their absence is not fatal, so a failure here is not.
 		if _, err := run(ctx, "apt-get", "install", "-y", "--no-install-recommends",
 			"linux-headers-"+kernelRelease()); err != nil {
-			log.Printf("[gpu] could not install kernel headers: %v", err)
+			slog.Info(fmt.Sprintf("could not install kernel headers: %v", err), "component", "gpu")
 		}
 
 		if err := aptInstall(ctx, driver, utils); err != nil {
@@ -633,11 +627,8 @@ func installNvidiaStack(ctx context.Context, layout Layout) error {
 			return err
 		}
 
-		log.Printf(
-			"[gpu] %s installed. The GPU will not be usable until the machine reboots; "+
-				"reboot it and the next cycle will finish the setup",
-			driver,
-		)
+		slog.Info(fmt.Sprintf("[gpu] %s installed. The GPU will not be usable until the machine reboots; "+
+			"reboot it and the next cycle will finish the setup", driver))
 
 		return fmt.Errorf("reboot required: %s was just installed and the driver is not loaded yet", driver)
 	}
@@ -666,7 +657,7 @@ func rebootMarker(layout Layout) string {
 // clearRebootMarker drops the marker once the condition that created it is gone.
 func clearRebootMarker(layout Layout) {
 	if err := os.Remove(rebootMarker(layout)); err != nil && !os.IsNotExist(err) {
-		log.Printf("[gpu] could not clear the reboot marker: %v", err)
+		slog.Info(fmt.Sprintf("could not clear the reboot marker: %v", err), "component", "gpu")
 	}
 }
 
@@ -686,7 +677,7 @@ func configureCdi() error {
 	}
 
 	if out, err := execOutput("systemctl", "start", "nvidia-cdi-refresh.service"); err != nil {
-		log.Printf("[gpu] nvidia-cdi-refresh.service: %s", out)
+		slog.Info(fmt.Sprintf("nvidia-cdi-refresh.service: %s", out), "component", "gpu")
 	}
 
 	// A refresh service that was just installed may still be settling, so give
@@ -697,7 +688,7 @@ func configureCdi() error {
 			return nil
 		}
 
-		log.Printf("[gpu] CDI does not expose a GPU yet (attempt %d)", attempt+1)
+		slog.Info(fmt.Sprintf("CDI does not expose a GPU yet (attempt %d)", attempt+1), "component", "gpu")
 
 		time.Sleep(2 * time.Second)
 	}
@@ -751,7 +742,7 @@ func setupDockerGPU(_ *config.Config, _ Layout) func(context.Context) error {
 			)
 		}
 
-		log.Printf("[docker-gpu] a container can reach the GPU")
+		slog.Info("a container can reach the GPU", "component", "docker-gpu")
 
 		return nil
 	}
@@ -791,7 +782,7 @@ func setupRclone(_ *config.Config, layout Layout) func(context.Context) error {
 
 		for _, line := range strings.Split(version, "\n") {
 			if strings.HasPrefix(line, "rclone v") {
-				log.Printf("[rclone] %s", strings.TrimSpace(line))
+				slog.Info(fmt.Sprintf("%s", strings.TrimSpace(line)), "component", "rclone")
 
 				break
 			}
@@ -818,7 +809,7 @@ func setupRclone(_ *config.Config, layout Layout) func(context.Context) error {
 func setupS3(cfg *config.Config, layout Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if cfg == nil || !cfg.S3.Enabled {
-			log.Printf("[s3] disabled in config, nothing to verify")
+			slog.Info("disabled in config, nothing to verify", "component", "s3")
 
 			return nil
 		}
@@ -843,7 +834,7 @@ func setupS3(cfg *config.Config, layout Layout) func(context.Context) error {
 			)
 		}
 
-		log.Printf("[s3] remote healthy: %s", target)
+		slog.Info(fmt.Sprintf("remote healthy: %s", target), "component", "s3")
 
 		return nil
 	}
@@ -862,14 +853,14 @@ func s3Target(cfg *config.Config) string {
 func setupTooling(cfg *config.Config, _ Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if cfg == nil || len(cfg.Tooling.Packages) == 0 {
-			log.Printf("[tooling] no packages requested")
+			slog.Info("no packages requested", "component", "tooling")
 
 			return nil
 		}
 
 		missing := aptPackagesMissing(cfg.Tooling.Packages)
 		if len(missing) == 0 {
-			log.Printf("[tooling] all %d requested packages are present", len(cfg.Tooling.Packages))
+			slog.Info(fmt.Sprintf("all %d requested packages are present", len(cfg.Tooling.Packages)), "component", "tooling")
 
 			return nil
 		}
@@ -883,7 +874,7 @@ func setupTooling(cfg *config.Config, _ Layout) func(context.Context) error {
 			)
 		}
 
-		log.Printf("[tooling] installed %s", strings.Join(missing, ", "))
+		slog.Info(fmt.Sprintf("installed %s", strings.Join(missing, ", ")), "component", "tooling")
 
 		return nil
 	}
@@ -900,7 +891,7 @@ func setupWorkspace(_ *config.Config, layout Layout) func(context.Context) error
 		}
 
 		if created {
-			log.Printf("[workspace] created %s", layout.Workspace)
+			slog.Info(fmt.Sprintf("created %s", layout.Workspace), "component", "workspace")
 		}
 
 		// Prove the login user can actually write there, not just that the
@@ -926,7 +917,7 @@ func setupWorkspace(_ *config.Config, layout Layout) func(context.Context) error
 func setupOpenCode(cfg *config.Config, layout Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if cfg == nil || !cfg.Coding.OpenCode {
-			log.Printf("[opencode] disabled in config, nothing to do")
+			slog.Info("disabled in config, nothing to do", "component", "opencode")
 
 			return nil
 		}
@@ -950,7 +941,7 @@ func setupOpenCode(cfg *config.Config, layout Layout) func(context.Context) erro
 			return fmt.Errorf("opencode --version: %w", err)
 		}
 
-		log.Printf("[opencode] %s configured in %s", strings.TrimSpace(version), layout.Workspace)
+		slog.Info(fmt.Sprintf("%s configured in %s", strings.TrimSpace(version), layout.Workspace), "component", "opencode")
 
 		return nil
 	}
@@ -961,7 +952,7 @@ func installOpenCode(ctx context.Context, layout Layout) error {
 		return fmt.Errorf("opencode is not installed and installing it needs root")
 	}
 
-	log.Printf("[opencode] installing opencode")
+	slog.Info("installing opencode", "component", "opencode")
 
 	// OpenCode's own installer writes to the invoking user's home, so it has to
 	// run as that user or the binary ends up somewhere the user cannot reach.
@@ -1061,7 +1052,7 @@ func maxOutputTokens(cfg *config.Config) int {
 func setupVLLM(cfg *config.Config, layout Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if cfg == nil {
-			log.Printf("[vllm] no config, nothing to do")
+			slog.Info("no config, nothing to do", "component", "vllm")
 
 			return nil
 		}
@@ -1079,14 +1070,14 @@ func setupVLLM(cfg *config.Config, layout Layout) func(context.Context) error {
 		out, err := waitForInference(ctx, endpoint, model, 30*time.Minute)
 		if err != nil {
 			if logs := containerLogs(ctx, dockerContainerName, 200); logs != "" {
-				log.Printf("[vllm] last %d log lines:\n%s", 200, logs)
+				slog.Info(fmt.Sprintf("last %d log lines:\n%s", 200, logs), "component", "vllm")
 			}
 
 			return err
 		}
 
-		log.Printf("[vllm] serving %s on port %d", model, port)
-		log.Printf("[vllm] /v1/models: %s", out)
+		slog.Info(fmt.Sprintf("serving %s on port %d", model, port), "component", "vllm")
+		slog.Info(fmt.Sprintf("/v1/models: %s", out), "component", "vllm")
 
 		return nil
 	}
@@ -1128,7 +1119,7 @@ func reconcileVLLMContainer(
 			}
 		}
 
-		log.Printf("[vllm] replacing the existing %s container", dockerContainerName)
+		slog.Info(fmt.Sprintf("replacing the existing %s container", dockerContainerName), "component", "vllm")
 
 		if _, err := run(ctx, "docker", "rm", "-f", dockerContainerName); err != nil {
 			return fmt.Errorf("remove the old vllm container: %w", err)
@@ -1260,7 +1251,7 @@ func statusPageResponds(ctx context.Context, port int) bool {
 func setupSync(cfg *config.Config, layout Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if cfg == nil || !cfg.S3.Enabled {
-			log.Printf("[sync] s3 is disabled, no workspace sync")
+			slog.Info("s3 is disabled, no workspace sync", "component", "sync")
 
 			return nil
 		}
@@ -1325,7 +1316,7 @@ WantedBy=timers.target
 			return err
 		}
 
-		log.Printf("[sync] workspace %s -> %s every %s", layout.Workspace, s3Target(cfg), interval)
+		slog.Info(fmt.Sprintf("workspace %s -> %s every %s", layout.Workspace, s3Target(cfg), interval), "component", "sync")
 
 		return nil
 	}

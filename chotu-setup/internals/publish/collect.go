@@ -2,6 +2,7 @@ package publish
 
 import (
 	"context"
+	"log/slog"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -215,7 +216,13 @@ func runWithTimeout(ctx context.Context, name string, args ...string) (string, e
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	slog.Debug("running command for metrics collection", "component", "status", "command", name, "args", args)
+
 	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+
+	if err != nil {
+		slog.Debug("metrics collection command failed", "component", "status", "command", name, "error", err, "output", string(out))
+	}
 
 	return strings.TrimSpace(string(out)), err
 }

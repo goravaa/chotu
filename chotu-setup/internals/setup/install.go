@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,7 +42,7 @@ func withAptLock(fn func() error) error {
 	if err != nil {
 		// A missing lock file is not worth failing over: apt will create it
 		// itself and the in-process mutex already covers our own tasks.
-		log.Printf("[apt] cannot lock %s (%v); relying on apt's own locking", dpkgLockPath, err)
+		slog.Info(fmt.Sprintf("cannot lock %s (%v); relying on apt's own locking", dpkgLockPath, err), "component", "apt")
 
 		return fn()
 	}
@@ -107,7 +107,7 @@ func aptInstall(ctx context.Context, pkgs ...string) error {
 		return nil
 	}
 
-	log.Printf("[apt] installing %s", strings.Join(missing, ", "))
+	slog.Info(fmt.Sprintf("installing %s", strings.Join(missing, ", ")), "component", "apt")
 
 	return withAptLock(func() error {
 		runCtx, cancel := context.WithTimeout(ctx, aptTimeout)
@@ -162,7 +162,7 @@ func aptRepo(ctx context.Context, name, keyURL, keyring, listURL string) (bool, 
 		return false, fmt.Errorf("adding the %s apt repository needs root", name)
 	}
 
-	log.Printf("[apt] adding the %s repository", name)
+	slog.Info(fmt.Sprintf("adding the %s repository", name), "component", "apt")
 
 	added := false
 
@@ -276,7 +276,7 @@ func enableUnit(ctx context.Context, unit string) error {
 		return fmt.Errorf("enable %s: %w", unit, err)
 	}
 
-	log.Printf("[systemd] started %s", unit)
+	slog.Info(fmt.Sprintf("started %s", unit), "component", "systemd")
 
 	return nil
 }
@@ -295,6 +295,6 @@ func jsonMarshalIndent(value any) ([]byte, error) {
 // daemonReload tells systemd about unit files that were written this cycle.
 func daemonReload(ctx context.Context) {
 	if _, err := run(ctx, "systemctl", "daemon-reload"); err != nil {
-		log.Printf("[systemd] daemon-reload failed: %v", err)
+		slog.Info(fmt.Sprintf("daemon-reload failed: %v", err), "component", "systemd")
 	}
 }

@@ -3,7 +3,7 @@ package setup
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -251,10 +251,10 @@ func mountInfo(path string) string {
 func logLayout(layout Layout) {
 	mounted, _ := isMountpoint(layout.DataDir)
 
-	log.Printf("[storage] mode=%s", layout.Mode)
-	log.Printf("[storage] workspace=%s", layout.Workspace)
-	log.Printf("[storage] docker-root=%s", layout.DockerRoot)
-	log.Printf("[storage] model-cache=%s", layout.ModelCache)
-	log.Printf("[storage] state=%s", layout.StateDir)
-	log.Printf("[storage] data=%s (fstype=%s mount=%t)", layout.DataDir, mountInfo(layout.DataDir), mounted)
+	slog.Info(fmt.Sprintf("mode=%s", layout.Mode), "component", "storage")
+	slog.Info(fmt.Sprintf("workspace=%s", layout.Workspace), "component", "storage")
+	slog.Info(fmt.Sprintf("docker-root=%s", layout.DockerRoot), "component", "storage")
+	slog.Info(fmt.Sprintf("model-cache=%s", layout.ModelCache), "component", "storage")
+	slog.Info(fmt.Sprintf("state=%s", layout.StateDir), "component", "storage")
+	slog.Info(fmt.Sprintf("data=%s (fstype=%s mount=%t)", layout.DataDir, mountInfo(layout.DataDir), mounted), "component", "storage")
 }

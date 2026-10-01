@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -66,15 +66,38 @@ func run() int {
 		"delay before the first task retry, doubled on each subsequent retry",
 	)
 
+	logLevelFlag := flag.String(
+		"log-level",
+		envString("CHOTU_LOG_LEVEL", "info"),
+		"logging level (debug, info, warn, error)",
+	)
+
 	flag.Parse()
 
+	var logLevel slog.Level
+	switch *logLevelFlag {
+	case "debug":
+		logLevel = slog.LevelDebug
+	case "warn", "warning":
+		logLevel = slog.LevelWarn
+	case "error":
+		logLevel = slog.LevelError
+	default:
+		logLevel = slog.LevelInfo
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	}))
+	slog.SetDefault(logger)
+
 	if *interval <= 0 {
-		log.Printf("invalid -interval %s: must be positive", *interval)
+		slog.Error("invalid -interval: must be positive", "interval", *interval)
 		return 2
 	}
 
 	if *attempts < 1 {
-		log.Printf("invalid -attempts %d: must be at least 1", *attempts)
+		slog.Error("invalid -attempts: must be at least 1", "attempts", *attempts)
 		return 2
 	}
 
@@ -89,26 +112,26 @@ func run() int {
 	// two in step when -db points somewhere other than the default.
 	if os.Getenv("CHOTU_STATE_DIR") == "" {
 		if err := os.Setenv("CHOTU_STATE_DIR", filepath.Dir(*dbPath)); err != nil {
-			log.Printf("set CHOTU_STATE_DIR: %v", err)
+			slog.Error("failed to set CHOTU_STATE_DIR", "error", err)
 		}
 	}
 
 	db, err := state.Open(*dbPath)
 	if err != nil {
-		log.Printf("open state database: %v", err)
+		slog.Error("failed to open state database", "error", err)
 		return 1
 	}
 	defer db.Close() //nolint:errcheck // main cannot report it; the process is exiting
 
-	log.Printf(
-		"chotu-setup %s starting: config=%s db=%s interval=%s once=%t attempts=%d retry-delay=%s",
-		version,
-		*configPath,
-		*dbPath,
-		*interval,
-		*once,
-		*attempts,
-		*retryDelay,
+	slog.Info(
+		"chotu-setup starting",
+		"version", version,
+		"config", *configPath,
+		"db", *dbPath,
+		"interval", *interval,
+		"once", *once,
+		"attempts", *attempts,
+		"retry-delay", *retryDelay,
 	)
 
 	if *once {
@@ -121,7 +144,7 @@ func run() int {
 			*retryDelay,
 		)
 		if err != nil {
-			log.Printf("setup cycle failed: %v", err)
+			slog.Error("setup cycle failed", "error", err)
 			return 1
 		}
 
@@ -160,7 +183,7 @@ func runDaemon(
 
 	for {
 		if ctx.Err() != nil {
-			log.Printf("shutdown requested; stopping after %d cycles", cycles)
+			slog.Info("shutdown requested", "cycles", cycles)
 			return 0
 		}
 
@@ -168,7 +191,7 @@ func runDaemon(
 
 		started := time.Now()
 
-		log.Printf("setup cycle %d starting", cycles)
+		slog.Info("setup cycle starting", "cycle", cycles)
 
 		cycle, err := runCycle(
 			ctx,
@@ -179,7 +202,7 @@ func runDaemon(
 			retryDelay,
 		)
 		if err != nil {
-			log.Printf("setup cycle %d error: %v", cycles, err)
+			slog.Error("setup cycle error", "cycle", cycles, "error", err)
 		}
 
 		// Publish after every cycle, including a failed one. The user watching
@@ -190,15 +213,15 @@ func runDaemon(
 			publishStatus(ctx, collector, cycle, cycles)
 		}
 
-		log.Printf(
-			"setup cycle %d finished in %s",
-			cycles,
-			time.Since(started).Round(time.Millisecond),
+		slog.Info(
+			"setup cycle finished",
+			"cycle", cycles,
+			"duration", time.Since(started).Round(time.Millisecond),
 		)
 
 		select {
 		case <-ctx.Done():
-			log.Printf("shutdown requested; stopping after %d cycles", cycles)
+			slog.Info("shutdown requested", "cycles", cycles)
 			return 0
 		case <-time.After(interval):
 		}
@@ -290,11 +313,7 @@ func runCycle(
 			return nil, err
 		}
 	} else if machine.ConfigHash != configHash {
-		log.Printf(
-			"config changed: %s -> %s, re-running setup",
-			machine.ConfigHash,
-			configHash,
-		)
+		slog.Info("config changed, re-running setup", "old_hash", machine.ConfigHash, "new_hash", configHash)
 	}
 
 	if err := state.UpdateMachineState(
@@ -344,13 +363,13 @@ func runCycle(
 	report.Duration = time.Since(started)
 
 	for _, name := range failed {
-		log.Printf("task %s failed: %v", name, results[name].Error)
+		slog.Error("task failed", "task", name, "error", results[name].Error)
 	}
 
-	log.Printf(
-		"setup finished: %d tasks, machine state %s",
-		len(results),
-		finalState,
+	slog.Info(
+		"setup finished",
+		"tasks_count", len(results),
+		"state", finalState,
 	)
 
 	return report, nil
@@ -382,13 +401,7 @@ func envInt(name string, fallback int) int {
 
 	parsed, err := strconv.Atoi(raw)
 	if err != nil {
-		log.Printf(
-			"%s=%q is not a valid integer (%v), using %d",
-			name,
-			raw,
-			err,
-			fallback,
-		)
+		slog.Warn("invalid integer environment variable, using fallback", "name", name, "raw", raw, "error", err, "fallback", fallback)
 
 		return fallback
 	}
@@ -404,13 +417,7 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 
 	parsed, err := time.ParseDuration(raw)
 	if err != nil {
-		log.Printf(
-			"%s=%q is not a valid duration (%v), using %s",
-			name,
-			raw,
-			err,
-			fallback,
-		)
+		slog.Warn("invalid duration environment variable, using fallback", "name", name, "raw", raw, "error", err, "fallback", fallback)
 
 		return fallback
 	}
