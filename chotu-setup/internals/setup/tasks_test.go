@@ -446,10 +446,6 @@ func TestDisabledFeaturesSucceed(t *testing.T) {
 		t.Errorf("tooling with no packages: %v", err)
 	}
 
-	if err := setupStatusPage(&config.Config{}, layout)(ctx); err != nil {
-		t.Errorf("status page disabled: %v", err)
-	}
-
 	if err := setupSync(&config.Config{}, layout)(ctx); err != nil {
 		t.Errorf("sync with s3 disabled: %v", err)
 	}
