@@ -41,6 +41,11 @@ func (h *StatusHub) RemoveClient(client chan status.Status) {
 	close(client)
 }
 
+// Each client has a one-slot buffer containing the latest status.
+// Older pending statuses are intentionally discarded.
+//
+// TODO: If we later need status history, replay, or guaranteed delivery,
+// introduce a persistent event/state store rather than growing this buffer.
 func (h *StatusHub) Broadcast(status status.Status) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -49,8 +54,16 @@ func (h *StatusHub) Broadcast(status status.Status) {
 		select {
 		case client <- status:
 		default:
-			// Don't block the status update if a client
-			// hasn't consumed the previous update yet.
+			// Buffer is full, so replace the stale status with the latest one.
+			select {
+			case <-client:
+			default:
+			}
+
+			select {
+			case client <- status:
+			default:
+			}
 		}
 	}
 }
