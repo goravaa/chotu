@@ -217,12 +217,12 @@ func setupMachine(cfg *config.Config) func(context.Context) error {
 			return fmt.Errorf("unsupported architecture %s: Chotu targets x86_64", arch())
 		}
 
-		if _, err := run(ctx, "nvidia-smi", "-L"); err != nil {
+		if out, err := run(ctx, "lspci", "-nn"); err != nil {
+			return fmt.Errorf("check PCI devices: %w", err)
+		} else if !strings.Contains(strings.ToLower(out), "nvidia") {
 			return fmt.Errorf(
-				"no NVIDIA GPU is visible: the instance type in config is %q, "+
-					"which has no GPU. Provisioning mistake, not something setup can fix: %w",
+				"no NVIDIA GPU is attached: the instance type in config is %q",
 				instanceType(cfg),
-				err,
 			)
 		}
 
