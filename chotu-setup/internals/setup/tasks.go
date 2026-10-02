@@ -1383,10 +1383,23 @@ func setupStatusPage(cfg *config.Config, _ Layout) func(context.Context) error {
 }
 
 func statusPageResponds(ctx context.Context, port int) bool {
-	_, err := run(ctx, "curl", "-fsS", "--max-time", "5",
-		fmt.Sprintf("http://127.0.0.1:%d/", port))
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
 
-	return err == nil
+	for {
+		if _, err := run(ctx, "curl", "-fsS", "--max-time", "1",
+			fmt.Sprintf("http://127.0.0.1:%d/", port)); err == nil {
+			return true
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline.C:
+			return false
+		case <-time.After(1 * time.Second):
+		}
+	}
 }
 
 // setupSync installs the timer that pushes the workspace to the bucket, and the
