@@ -12,14 +12,12 @@ import (
 	"github.com/goravaa/chotu/chotu-setup/internals/config"
 )
 
-// The instance store is always mounted at the data directory, in both storage
-// modes. What changes is whether it is the machine's primary storage or only
-// scratch space.
+// The instance store is always mounted at the data directory.
+//
+// In persistent mode it is scratch space.
+// In ephemeral mode it is the machine's primary storage.
 const defaultDataDir = "/data"
 
-// Paths on the root disk, used when persistence is on. They are spelled out in
-// full rather than joined onto a configurable root, because there is exactly one
-// root disk and a partially applied relocation is worse than none.
 const (
 	rootDiskDockerRoot = "/var/lib/docker"
 	rootDiskModelCache = "/var/lib/chotu/huggingface"
@@ -37,8 +35,8 @@ type Layout struct {
 	DataDir string
 
 	// RunUser is the unprivileged user the machine is prepared for. Chotu runs
-	// as root because it installs system packages, but the workspace belongs to
-	// this user.
+	// as root because it installs system packages, but the workspace belongs
+	// to this user.
 	RunUser string
 
 	// Home is RunUser's home directory.
@@ -59,10 +57,9 @@ func (l Layout) IsPersistent() bool { return l.Mode == "persistent" }
 
 // RequiresDataDir reports whether the instance store must be attached.
 //
-// A disposable spot machine has no other choice: the instance store is where
-// the workspace and the Docker root live, so without it there is nothing to
-// run on. A persistent machine already has a root disk, so the instance store
-// is an optimisation and its absence is only worth reporting.
+// An ephemeral machine uses the instance store as its primary storage.
+// A persistent machine uses the root disk as primary storage, so the
+// instance store is optional scratch space.
 func (l Layout) RequiresDataDir() bool { return !l.IsPersistent() }
 
 // ResolveLayout turns the config into the concrete paths the tasks use.
@@ -71,21 +68,22 @@ func ResolveLayout(cfg *config.Config) Layout {
 	runUser, home := resolveRunUser()
 
 	layout := Layout{
-		Mode:     "ephemeral",
-		DataDir:  envOr("CHOTU_DATA_DIR", defaultDataDir),
-		RunUser:  runUser,
-		Home:     home,
-		StateDir: rootDiskStateDir,
+		Mode:    "ephemeral",
+		DataDir: envOr("CHOTU_DATA_DIR", defaultDataDir),
+		RunUser: runUser,
+		Home:    home,
 	}
 
 	if persist {
 		layout.Mode = "persistent"
 
+		// Root disk is primary storage. /data is scratch.
 		layout.DockerRoot = rootDiskDockerRoot
 		layout.ModelCache = rootDiskModelCache
 		layout.StateDir = rootDiskStateDir
 		layout.Workspace = filepath.Join(home, "workspace")
 	} else {
+		// Instance store is primary storage.
 		layout.DockerRoot = filepath.Join(layout.DataDir, "docker")
 		layout.ModelCache = filepath.Join(layout.DataDir, "huggingface")
 		layout.StateDir = filepath.Join(layout.DataDir, "chotu")
@@ -199,9 +197,8 @@ func chownRecursive(path, user string) error {
 // that happens to exist on the root filesystem.
 //
 // os.Stat alone cannot tell the two apart, and the difference is the whole
-// point of the instance store: on a spot machine an unmounted /data silently
-// means the workspace lands on the small root disk and is lost when the
-// instance is reclaimed.
+// point of the instance store: on an ephemeral machine an unmounted /data
+// silently means the workspace lands on the root disk.
 func isMountpoint(path string) (bool, error) {
 	var target, parent syscall.Stat_t
 
@@ -256,5 +253,14 @@ func logLayout(layout Layout) {
 	slog.Info(fmt.Sprintf("docker-root=%s", layout.DockerRoot), "component", "storage")
 	slog.Info(fmt.Sprintf("model-cache=%s", layout.ModelCache), "component", "storage")
 	slog.Info(fmt.Sprintf("state=%s", layout.StateDir), "component", "storage")
-	slog.Info(fmt.Sprintf("data=%s (fstype=%s mount=%t)", layout.DataDir, mountInfo(layout.DataDir), mounted), "component", "storage")
+	slog.Info(
+		fmt.Sprintf(
+			"data=%s (fstype=%s mount=%t)",
+			layout.DataDir,
+			mountInfo(layout.DataDir),
+			mounted,
+		),
+		"component",
+		"storage",
+	)
 }
