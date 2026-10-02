@@ -359,16 +359,6 @@ func TestResolveLayoutFollowsPersistence(t *testing.T) {
 			},
 		})
 
-		if !layout.IsPersistent() {
-			t.Fatal("persist=true: want persistent mode")
-		}
-
-		if layout.RequiresDataDir() {
-			t.Error("persist=true: the instance store is scratch and must not be required")
-		}
-
-		// The instance store is still the data directory, it just is not where
-		// the workspace lives.
 		if layout.DataDir != "/mnt/instance-store" {
 			t.Errorf("DataDir = %q, want the instance store at /mnt/instance-store", layout.DataDir)
 		}
@@ -402,14 +392,6 @@ func TestResolveLayoutFollowsPersistence(t *testing.T) {
 		t.Setenv("CHOTU_LOG_DIR", "")
 
 		layout := ResolveLayout(&config.Config{})
-
-		if layout.IsPersistent() {
-			t.Fatal("persist=false: want ephemeral mode")
-		}
-
-		if !layout.RequiresDataDir() {
-			t.Error("persist=false: the instance store is the only storage and must be required")
-		}
 
 		for name, path := range map[string]string{
 			"Workspace":  layout.Workspace,

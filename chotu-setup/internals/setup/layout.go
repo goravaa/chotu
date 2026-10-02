@@ -51,17 +51,6 @@ type Layout struct {
 	Workspace  string
 }
 
-// IsPersistent reports whether the machine keeps its state on a disk that
-// outlives the instance.
-func (l Layout) IsPersistent() bool { return l.Mode == "persistent" }
-
-// RequiresDataDir reports whether the instance store must be attached.
-//
-// An ephemeral machine uses the instance store as its primary storage.
-// A persistent machine uses the root disk as primary storage, so the
-// instance store is optional scratch space.
-func (l Layout) RequiresDataDir() bool { return !l.IsPersistent() }
-
 // ResolveLayout turns the config into the concrete paths the tasks use.
 func ResolveLayout(cfg *config.Config) Layout {
 	persist := cfg != nil && cfg.Machine.Storage.Persist

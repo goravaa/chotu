@@ -263,38 +263,32 @@ func osReleaseValue(contents, key string) string {
 // setupStorage prepares the storage topology the machine runs on: the instance
 // store, the state directory, the model cache and the workspace.
 //
-// The topology follows machine.storage.persist. On a disposable spot machine the
-// instance store is the only storage worth having, so the workspace and the
-// Docker root go there and the task fails loudly when it is missing. On a
-// persistent machine the root disk is the primary storage and the instance
-// store is scratch.
+// /data must always be mounted as the EC2 instance store. In ephemeral mode it
+// is the primary storage. In persistent mode it is scratch storage.
 func setupStorage(cfg *config.Config, layout Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		logLayout(layout)
 
 		mounted, mountErr := isMountpoint(layout.DataDir)
-
 		if mountErr != nil {
-			if layout.RequiresDataDir() {
-				return fmt.Errorf(
-					"the instance store is not mounted at %s and machine.storage.persist is "+
-						"false, so the workspace would be lost when the instance is reclaimed: %w",
-					layout.DataDir,
-					mountErr,
-				)
-			}
-		} else if !mounted && layout.RequiresDataDir() {
 			return fmt.Errorf(
-				"%s is not a mount point: the EC2 instance store must be attached and "+
-					"formatted, or set machine.storage.persist to true to keep state on the root disk",
+				"the instance store is not mounted at %s: %w",
+				layout.DataDir,
+				mountErr,
+			)
+		}
+		if !mounted {
+			return fmt.Errorf(
+				"%s is not a mount point: the EC2 instance store must be attached and formatted",
 				layout.DataDir,
 			)
-		} else if !mounted {
-			slog.Info(fmt.Sprintf("[storage] %s is not a mount point; continuing because the root disk is the "+
-				"primary storage in persistent mode", layout.DataDir))
 		}
 
-		for _, dir := range []string{layout.StateDir, layout.LogDir, layout.ModelCache} {
+		for _, dir := range []string{
+			layout.StateDir,
+			layout.LogDir,
+			layout.ModelCache,
+		} {
 			if _, err := ensureDir(dir, layout.RunUser); err != nil {
 				return err
 			}
@@ -305,11 +299,22 @@ func setupStorage(cfg *config.Config, layout Layout) func(context.Context) error
 			return fmt.Errorf("check storage for %s: %w", layout.StateDir, err)
 		}
 
-		slog.Info(fmt.Sprintf("state filesystem:\n%s", usage), "component", "storage")
+		slog.Info(
+			fmt.Sprintf("state filesystem:\n%s", usage),
+			"component",
+			"storage",
+		)
 
 		if cfg != nil && cfg.Machine.Storage.RootDiskSizeGB > 0 {
-			slog.Info(fmt.Sprintf("configured root disk: %d GB %s", cfg.Machine.Storage.RootDiskSizeGB,
-				cfg.Machine.Storage.RootDiskType), "component", "storage")
+			slog.Info(
+				fmt.Sprintf(
+					"configured root disk: %d GB %s",
+					cfg.Machine.Storage.RootDiskSizeGB,
+					cfg.Machine.Storage.RootDiskType,
+				),
+				"component",
+				"storage",
+			)
 		}
 
 		return nil
