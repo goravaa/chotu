@@ -14,6 +14,7 @@ import (
 )
 
 const (
+	TaskStatus    = "status"
 	TaskMachine   = "machine"
 	TaskStorage   = "storage"
 	TaskDocker    = "docker"
@@ -36,10 +37,11 @@ const (
 	defaultNvidiaDriverPackage = "nvidia-driver-580-server"
 
 	dockerContainerName = "chotu-vllm"
+	statusContainerName = "chotu-status"
 )
 
 // nvidiaDriverPackage returns the driver package to install and the matching
-// userspace package. The userspace libraries are the part that has to line up
+// userspace package. The userspace libraries are t  he part that has to line up
 // with the kernel module, which is why they are installed together and verified
 // separately.
 //
@@ -63,59 +65,67 @@ func Tasks(cfg *config.Config) []*Task {
 
 	return []*Task{
 		{
-			Name: TaskMachine,
-			Run:  setupMachine(cfg),
+			Name: TaskStatus,
+			Run:  setupStatusPage(cfg, layout),
 		},
 		{
-			Name: TaskStorage,
-			Run:  setupStorage(cfg, layout),
+			Name:         TaskMachine,
+			Dependencies: []string{TaskStatus},
+			Run:          setupMachine(cfg),
 		},
 		{
-			Name: TaskDocker,
-			Run:  setupDocker(cfg, layout),
+			Name:         TaskStorage,
+			Dependencies: []string{TaskStatus},
+			Run:          setupStorage(cfg, layout),
 		},
 		{
-			Name: TaskGPU,
-			Run:  setupGPU(cfg, layout),
+			Name:         TaskDocker,
+			Dependencies: []string{TaskStatus},
+			Run:          setupDocker(cfg, layout),
+		},
+		{
+			Name:         TaskGPU,
+			Dependencies: []string{TaskStatus},
+			Run:          setupGPU(cfg, layout),
 		},
 		{
 			Name:         TaskDockerGPU,
-			Dependencies: []string{TaskDocker, TaskGPU},
+			Dependencies: []string{TaskStatus, TaskDocker, TaskGPU},
 			Run:          setupDockerGPU(cfg, layout),
 		},
 		{
 			Name:         TaskRclone,
-			Dependencies: []string{TaskStorage},
+			Dependencies: []string{TaskStatus, TaskStorage},
 			Run:          setupRclone(cfg, layout),
 		},
 		{
 			Name:         TaskS3,
-			Dependencies: []string{TaskRclone},
+			Dependencies: []string{TaskStatus, TaskRclone},
 			Run:          setupS3(cfg, layout),
 		},
 		{
-			Name: TaskTooling,
-			Run:  setupTooling(cfg, layout),
+			Name:         TaskTooling,
+			Dependencies: []string{TaskStatus},
+			Run:          setupTooling(cfg, layout),
 		},
 		{
 			Name:         TaskWorkspace,
-			Dependencies: []string{TaskStorage, TaskTooling},
+			Dependencies: []string{TaskStatus, TaskStorage, TaskTooling},
 			Run:          setupWorkspace(cfg, layout),
 		},
 		{
 			Name:         TaskOpenCode,
-			Dependencies: []string{TaskWorkspace},
+			Dependencies: []string{TaskStatus, TaskWorkspace},
 			Run:          setupOpenCode(cfg, layout),
 		},
 		{
 			Name:         TaskVLLM,
-			Dependencies: []string{TaskDockerGPU, TaskStorage},
+			Dependencies: []string{TaskStatus, TaskDockerGPU, TaskStorage},
 			Run:          setupVLLM(cfg, layout),
 		},
-
 		{
 			Name:         TaskSync,
-			Dependencies: []string{TaskWorkspace, TaskS3},
+			Dependencies: []string{TaskStatus, TaskWorkspace, TaskS3},
 			Run:          setupSync(cfg, layout),
 		},
 	}
@@ -1237,6 +1247,139 @@ func containerLogs(ctx context.Context, container string, lines int) string {
 	}
 
 	return out
+}
+
+// setupStatusPage runs the status container that serves the progress page, so
+// the user can see what the machine is doing while it comes up.
+func setupStatusPage(cfg *config.Config, _ Layout) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if cfg == nil || !cfg.StatusPage.Enabled {
+			slog.Info("status page disabled in config", "component", "status")
+			return nil
+		}
+
+		image := cfg.StatusPage.Image
+		if image == "" {
+			return fmt.Errorf("status_page is enabled but status_page.image is empty")
+		}
+
+		port := cfg.StatusPage.Port
+		if port == 0 {
+			port = 8081
+		}
+
+		if existing, err := run(ctx, "docker", "inspect", "--format",
+			"{{.Config.Image}} {{.State.Running}}", statusContainerName); err == nil {
+			fields := strings.Fields(existing)
+
+			if len(fields) == 2 && fields[0] == image && fields[1] == "true" {
+				if statusPageResponds(ctx, port) {
+					slog.Info(
+						"status page already running",
+						"component", "status",
+						"image", image,
+						"port", port,
+					)
+					return nil
+				}
+
+				slog.Warn(
+					"status container is running but page is not responding",
+					"component", "status",
+					"image", image,
+					"port", port,
+				)
+			}
+
+			slog.Info(
+				"removing existing status container",
+				"component", "status",
+				"container", statusContainerName,
+			)
+
+			if _, err := run(ctx, "docker", "rm", "-f", statusContainerName); err != nil {
+				return fmt.Errorf("remove the old status container: %w", err)
+			}
+		}
+
+		slog.Info(
+			"pulling status page image",
+			"component", "status",
+			"image", image,
+		)
+
+		pullCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+
+		if out, err := execOutputCtx(pullCtx, "docker", "pull", image); err != nil {
+			return fmt.Errorf(
+				"pull the status image %s: %w: %s",
+				image,
+				err,
+				strings.TrimSpace(out),
+			)
+		}
+
+		runCtx, cancelRun := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancelRun()
+
+		args := []string{
+			"run", "-d",
+			"--name", statusContainerName,
+			"--restart", "unless-stopped",
+			"-p", fmt.Sprintf("%d:8081", port),
+		}
+
+		for _, mount := range []string{
+			"/:/host:ro,rslave",
+			"/var/run/docker.sock:/var/run/docker.sock:ro",
+		} {
+			if isDir(strings.Split(mount, ":")[0]) {
+				args = append(args, "-v", mount)
+			}
+		}
+
+		args = append(args, image)
+
+		slog.Info(
+			"starting status page container",
+			"component", "status",
+			"container", statusContainerName,
+			"image", image,
+			"port", port,
+		)
+
+		if out, err := execOutputCtx(runCtx, "docker", args...); err != nil {
+			return fmt.Errorf(
+				"start the status container: %w: %s",
+				err,
+				strings.TrimSpace(out),
+			)
+		}
+
+		slog.Debug(
+			"waiting for status page to respond",
+			"component", "status",
+			"port", port,
+		)
+
+		if !statusPageResponds(ctx, port) {
+			return fmt.Errorf(
+				"the status container is running but %s did not respond; the image may be "+
+					"wrong or may not be the Chotu status service",
+				fmt.Sprintf("http://127.0.0.1:%d/", port),
+			)
+		}
+
+		slog.Info(
+			"status page ready",
+			"component", "status",
+			"image", image,
+			"port", port,
+		)
+
+		return nil
+	}
 }
 
 func statusPageResponds(ctx context.Context, port int) bool {
