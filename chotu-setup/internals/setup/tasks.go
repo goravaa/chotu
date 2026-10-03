@@ -75,57 +75,57 @@ func Tasks(cfg *config.Config) []*Task {
 		},
 		{
 			Name:         TaskStorage,
-			Dependencies: []string{TaskStatus},
+			Dependencies: []string{TaskStatus, TaskMachine},
 			Run:          setupStorage(cfg, layout),
 		},
 		{
 			Name:         TaskDocker,
-			Dependencies: []string{TaskStatus},
+			Dependencies: []string{TaskStatus, TaskMachine},
 			Run:          setupDocker(cfg, layout),
 		},
 		{
 			Name:         TaskGPU,
-			Dependencies: []string{TaskStatus},
+			Dependencies: []string{TaskStatus, TaskMachine},
 			Run:          setupGPU(cfg, layout),
 		},
 		{
 			Name:         TaskDockerGPU,
-			Dependencies: []string{TaskStatus, TaskDocker, TaskGPU},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskDocker, TaskGPU},
 			Run:          setupDockerGPU(cfg, layout),
 		},
 		{
 			Name:         TaskRclone,
-			Dependencies: []string{TaskStatus, TaskStorage},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskStorage},
 			Run:          setupRclone(cfg, layout),
 		},
 		{
 			Name:         TaskS3,
-			Dependencies: []string{TaskStatus, TaskRclone},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskRclone},
 			Run:          setupS3(cfg, layout),
 		},
 		{
 			Name:         TaskTooling,
-			Dependencies: []string{TaskStatus},
+			Dependencies: []string{TaskStatus, TaskMachine},
 			Run:          setupTooling(cfg, layout),
 		},
 		{
 			Name:         TaskWorkspace,
-			Dependencies: []string{TaskStatus, TaskStorage, TaskTooling},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskStorage, TaskTooling},
 			Run:          setupWorkspace(cfg, layout),
 		},
 		{
 			Name:         TaskOpenCode,
-			Dependencies: []string{TaskStatus, TaskWorkspace},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskWorkspace},
 			Run:          setupOpenCode(cfg, layout),
 		},
 		{
 			Name:         TaskVLLM,
-			Dependencies: []string{TaskStatus, TaskDockerGPU, TaskStorage},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskDockerGPU, TaskStorage},
 			Run:          setupVLLM(cfg, layout),
 		},
 		{
 			Name:         TaskSync,
-			Dependencies: []string{TaskStatus, TaskWorkspace, TaskS3},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskWorkspace, TaskS3},
 			Run:          setupSync(cfg, layout),
 		},
 	}
