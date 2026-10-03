@@ -98,10 +98,10 @@ coding:
 
 
 # Progress page served over HTTP so the user can see what the machine is doing
-# while it comes up. Runs as a container pulled from a registry.
+# while it comes up. Bootstrap installs the status-service binary as a systemd
+# unit; the setup daemon only health-checks and restarts it.
 status_page:
   enabled: true
-  image: goravaa/chotu-status:latest
   port: 8081
 
 

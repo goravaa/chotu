@@ -81,13 +81,6 @@ func TestLoadRejectsIncompleteEnabledFeatures(t *testing.T) {
 			t.Errorf("err = %v, want it to name s3.bucket_name", err)
 		}
 	})
-
-	t.Run("status page enabled with no image", func(t *testing.T) {
-		_, err := Load(write(t, "status_page:\n  enabled: true\n"))
-		if err == nil || !strings.Contains(err.Error(), "image") {
-			t.Errorf("err = %v, want it to name status_page.image", err)
-		}
-	})
 }
 
 // TestImagesArePinned stops a floating tag from creeping back in. `latest` moves

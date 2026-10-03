@@ -37,7 +37,6 @@ const (
 	defaultNvidiaDriverPackage = "nvidia-driver-580-server"
 
 	dockerContainerName = "chotu-vllm"
-	statusContainerName = "chotu-status"
 )
 
 // nvidiaDriverPackage returns the driver package to install and the matching
@@ -260,8 +259,9 @@ func osReleaseValue(contents, key string) string {
 	return ""
 }
 
-// setupStorage prepares the storage topology the machine runs on: the instance
-// store, the state directory, the model cache and the workspace.
+// setupStorage verifies the instance store and creates the layout directories
+// that other tasks write into (state, logs, model cache, docker root).
+// Workspace creation stays in the workspace task.
 //
 // /data must always be mounted as the EC2 instance store. In ephemeral mode it
 // is the primary storage. In persistent mode it is scratch storage.
@@ -292,6 +292,13 @@ func setupStorage(cfg *config.Config, layout Layout) func(context.Context) error
 			if _, err := ensureDir(dir, layout.RunUser); err != nil {
 				return err
 			}
+		}
+
+		// Docker runs as root and owns its data root. Creating it here means
+		// the docker task can point data-root at a real path under /data in
+		// ephemeral mode instead of letting dockerd invent one after the fact.
+		if _, err := ensureDir(layout.DockerRoot, ""); err != nil {
+			return err
 		}
 
 		usage, err := run(ctx, "df", "-h", layout.StateDir)

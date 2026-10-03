@@ -21,8 +21,7 @@ import (
 )
 
 const (
-	defaultStateDBPath = "/var/lib/chotu/chotu.db"
-	defaultInterval    = 60 * time.Second
+	defaultInterval = 60 * time.Second
 )
 
 // version is stamped in at build time by the makefile. The daemon runs for the
@@ -42,8 +41,8 @@ func run() int {
 	)
 	dbPath := flag.String(
 		"db",
-		envString("CHOTU_STATE_DB", defaultStateDBPath),
-		"path to the Chotu state database",
+		"",
+		"path to the Chotu state database (default: <layout.StateDir>/chotu.db)",
 	)
 	interval := flag.Duration(
 		"interval",
@@ -108,15 +107,34 @@ func run() int {
 	)
 	defer stop()
 
-	// The storage task creates the directory the database lives in, so keep the
-	// two in step when -db points somewhere other than the default.
-	if os.Getenv("CHOTU_STATE_DIR") == "" {
-		if err := os.Setenv("CHOTU_STATE_DIR", filepath.Dir(*dbPath)); err != nil {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		slog.Error("failed to load config", "error", err)
+		return 1
+	}
+
+	// Resolve the DB path from the storage layout unless the operator overrode
+	// it. The old hard-coded default (/var/lib/chotu/chotu.db) also set
+	// CHOTU_STATE_DIR, which forced every machine onto the root-disk state path
+	// and broke ephemeral mode (workspace/docker on /data, state on root).
+	explicitDB := *dbPath != "" || os.Getenv("CHOTU_STATE_DB") != ""
+	resolvedDB := *dbPath
+	if resolvedDB == "" {
+		resolvedDB = os.Getenv("CHOTU_STATE_DB")
+	}
+
+	if explicitDB && os.Getenv("CHOTU_STATE_DIR") == "" {
+		if err := os.Setenv("CHOTU_STATE_DIR", filepath.Dir(resolvedDB)); err != nil {
 			slog.Error("failed to set CHOTU_STATE_DIR", "error", err)
 		}
 	}
 
-	db, err := state.Open(*dbPath)
+	layout := setup.ResolveLayout(cfg)
+	if !explicitDB {
+		resolvedDB = filepath.Join(layout.StateDir, "chotu.db")
+	}
+
+	db, err := state.Open(resolvedDB)
 	if err != nil {
 		slog.Error("failed to open state database", "error", err)
 		return 1
@@ -127,7 +145,9 @@ func run() int {
 		"chotu-setup starting",
 		"version", version,
 		"config", *configPath,
-		"db", *dbPath,
+		"db", resolvedDB,
+		"state_dir", layout.StateDir,
+		"storage_mode", layout.Mode,
 		"interval", *interval,
 		"once", *once,
 		"attempts", *attempts,
