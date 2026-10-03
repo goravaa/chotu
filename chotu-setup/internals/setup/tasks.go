@@ -339,11 +339,18 @@ func setupDocker(_ *config.Config, layout Layout) func(context.Context) error {
 			}
 		}
 
-		if err := writeDockerDaemonConfig(layout); err != nil {
+		wroteConfig, err := writeDockerDaemonConfig(layout)
+		if err != nil {
 			return err
 		}
 
-		if !unitRunning(ctx, "docker") {
+		if wroteConfig {
+			slog.Info("restarting docker to apply daemon.json", "component", "docker")
+
+			if _, err := run(ctx, "systemctl", "restart", "docker"); err != nil {
+				return fmt.Errorf("restart docker after daemon.json change: %w", err)
+			}
+		} else if !unitRunning(ctx, "docker") {
 			slog.Info("starting the daemon", "component", "docker")
 
 			if _, err := run(ctx, "systemctl", "enable", "--now", "docker"); err != nil {
@@ -445,8 +452,8 @@ func mustReadFile(path string) string {
 
 // writeDockerDaemonConfig points the daemon at the resolved data root and adds
 // the NVIDIA runtime. The file is only written when it changes, so a steady
-// cycle does not bounce the daemon.
-func writeDockerDaemonConfig(layout Layout) error {
+// cycle does not bounce the daemon. Returns whether the file was written.
+func writeDockerDaemonConfig(layout Layout) (bool, error) {
 	daemon := map[string]any{
 		"runtimes": map[string]any{
 			"nvidia": map[string]any{
@@ -465,19 +472,19 @@ func writeDockerDaemonConfig(layout Layout) error {
 
 	encoded, err := jsonMarshalIndent(daemon)
 	if err != nil {
-		return fmt.Errorf("render the docker daemon config: %w", err)
+		return false, fmt.Errorf("render the docker daemon config: %w", err)
 	}
 
 	wrote, err := writeFileIfChanged("/etc/docker/daemon.json", string(encoded), 0o644)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if wrote {
 		slog.Info(fmt.Sprintf("wrote /etc/docker/daemon.json (data-root %s)", layout.DockerRoot), "component", "docker")
 	}
 
-	return nil
+	return wrote, nil
 }
 
 // asRunUser runs a command as the user the machine is prepared for, so a
@@ -622,8 +629,7 @@ func installNvidiaStack(ctx context.Context, layout Layout) error {
 
 		// Headers let the driver build its kernel module against the running
 		// kernel. Their absence is not fatal, so a failure here is not.
-		if _, err := run(ctx, "apt-get", "install", "-y", "--no-install-recommends",
-			"linux-headers-"+kernelRelease()); err != nil {
+		if err := aptInstall(ctx, "linux-headers-"+kernelRelease()); err != nil {
 			slog.Info(fmt.Sprintf("could not install kernel headers: %v", err), "component", "gpu")
 		}
 
@@ -735,6 +741,8 @@ func setupDockerGPU(_ *config.Config, _ Layout) func(context.Context) error {
 			return fmt.Errorf("read docker runtimes: %w", err)
 		}
 
+		justConfigured := false
+
 		if !strings.Contains(out, "nvidia") {
 			if _, err := run(ctx, "nvidia-ctk", "runtime", "configure", "--runtime=docker"); err != nil {
 				return fmt.Errorf("docker has no nvidia runtime and it could not be added: %w", err)
@@ -748,10 +756,20 @@ func setupDockerGPU(_ *config.Config, _ Layout) func(context.Context) error {
 			if err != nil || !strings.Contains(out, "nvidia") {
 				return fmt.Errorf("docker has no nvidia runtime configured: %s", out)
 			}
+
+			justConfigured = true
 		}
 
-		// The smoke test pulls an image, so give it a budget of its own rather
-		// than the shared command timeout.
+		// Steady cycles already have the runtime and the gpu task verified
+		// nvidia-smi on the host. Re-pulling ubuntu and running nvidia-smi in a
+		// container every minute is correct but not cheap, so only smoke-test
+		// right after we configure the runtime.
+		if !justConfigured {
+			slog.Info("nvidia runtime already configured", "component", "docker-gpu")
+
+			return nil
+		}
+
 		runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 
@@ -916,17 +934,13 @@ func setupWorkspace(_ *config.Config, layout Layout) func(context.Context) error
 			slog.Info(fmt.Sprintf("created %s", layout.Workspace), "component", "workspace")
 		}
 
-		// Prove the login user can actually write there, not just that the
-		// directory exists with the right owner.
-		if isRoot() && layout.RunUser != "root" {
+		// Prove the login user can actually write there, not just that root can.
+		if layout.RunUser != "" && layout.RunUser != "root" {
 			probe := filepath.Join(layout.Workspace, ".chotu-write-probe")
 
-			if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
-				return fmt.Errorf("%s is not writable: %w", layout.Workspace, err)
-			}
-
-			if err := os.Remove(probe); err != nil {
-				return fmt.Errorf("clean up the write probe in %s: %w", layout.Workspace, err)
+			if _, err := asRunUser(ctx, layout, "bash", "-lc",
+				fmt.Sprintf("echo ok > %q && rm -f %q", probe, probe)); err != nil {
+				return fmt.Errorf("%s is not writable by %s: %w", layout.Workspace, layout.RunUser, err)
 			}
 		}
 
@@ -1128,14 +1142,16 @@ func reconcileVLLMContainer(
 	port int,
 	model string,
 ) error {
+	fingerprint := vllmFingerprint(cfg, image, port, model)
+
 	// The container is recreated when the configuration it was created from
 	// changes, and left alone when it matches, so a steady cycle does not
 	// restart a model that is already serving.
 	if existing, err := run(ctx, "docker", "inspect", "--format",
-		"{{.Config.Image}} {{.State.Running}}", dockerContainerName); err == nil {
+		`{{index .Config.Labels "chotu.fingerprint"}} {{.State.Running}}`, dockerContainerName); err == nil {
 		fields := strings.Fields(existing)
 
-		if len(fields) == 2 && fields[0] == image && fields[1] == "true" {
+		if len(fields) == 2 && fields[0] == fingerprint && fields[1] == "true" {
 			if ready, _ := inferenceReady(ctx, port, model); ready {
 				return nil
 			}
@@ -1168,14 +1184,20 @@ func reconcileVLLMContainer(
 		"--restart", "unless-stopped",
 		"--gpus", "all",
 		"--ipc=host",
+		"--label", "chotu.fingerprint=" + fingerprint,
 		"-p", fmt.Sprintf("%d:8000", port),
 		"-v", layout.ModelCache + ":/root/.cache/huggingface",
 		image,
 		"--model", model,
-		"--enable-auto-tool-choice",
-		"--tool-call-parser", toolCallParser(model),
 		"--max-model-len", fmt.Sprint(maxModelLen(cfg)),
 		"--gpu-memory-utilization", fmt.Sprintf("%g", gpuMemoryUtilization(cfg)),
+	}
+
+	if parser := toolCallParser(model); parser != "" {
+		args = append(args,
+			"--enable-auto-tool-choice",
+			"--tool-call-parser", parser,
+		)
 	}
 
 	if out, err := execOutputCtx(runCtx, "docker", args...); err != nil {
@@ -1183,6 +1205,20 @@ func reconcileVLLMContainer(
 	}
 
 	return nil
+}
+
+// vllmFingerprint captures the knobs that must recreate the container when
+// they change. Image alone is not enough: max-model-len and gpu util drift
+// would otherwise leave an already-running container forever.
+func vllmFingerprint(cfg *config.Config, image string, port int, model string) string {
+	return fmt.Sprintf("%s|%s|%d|%d|%g|%s",
+		image,
+		model,
+		port,
+		maxModelLen(cfg),
+		gpuMemoryUtilization(cfg),
+		toolCallParser(model),
+	)
 }
 
 func gpuMemoryUtilization(cfg *config.Config) float64 {

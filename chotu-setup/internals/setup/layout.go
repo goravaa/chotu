@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -165,12 +166,67 @@ func ensureDir(path string, owner string) (bool, error) {
 	}
 
 	if owner != "" && isRoot() {
-		if err := chownRecursive(path, owner); err != nil {
+		owned, err := dirOwnedBy(path, owner)
+		if err != nil {
 			return created, err
+		}
+
+		// Only chown when the top-level owner is wrong. A recursive chown on
+		// every cycle would thrash a large model cache for no reason.
+		if !owned {
+			if err := chownRecursive(path, owner); err != nil {
+				return created, err
+			}
+
+			return true, nil
 		}
 	}
 
 	return created, nil
+}
+
+// dirOwnedBy reports whether path is owned by user:user.
+func dirOwnedBy(path, owner string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, nil
+	}
+
+	uid, gid, err := userIDs(owner)
+	if err != nil {
+		return false, err
+	}
+
+	return stat.Uid == uid && stat.Gid == gid, nil
+}
+
+func userIDs(name string) (uid, gid uint32, err error) {
+	out, err := execOutput("getent", "passwd", name)
+	if err != nil {
+		return 0, 0, fmt.Errorf("lookup user %s: %w", name, err)
+	}
+
+	fields := strings.Split(strings.TrimSpace(out), ":")
+	if len(fields) < 4 {
+		return 0, 0, fmt.Errorf("lookup user %s: malformed passwd entry", name)
+	}
+
+	parsedUID, err := strconv.ParseUint(fields[2], 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("lookup user %s: bad uid %q: %w", name, fields[2], err)
+	}
+
+	parsedGID, err := strconv.ParseUint(fields[3], 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("lookup user %s: bad gid %q: %w", name, fields[3], err)
+	}
+
+	return uint32(parsedUID), uint32(parsedGID), nil
 }
 
 func chownRecursive(path, user string) error {

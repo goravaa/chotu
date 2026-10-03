@@ -84,19 +84,18 @@ func aptPackagesMissing(pkgs []string) []string {
 	return missing
 }
 
-// aptUpdate refreshes the package index.
-func aptUpdate(ctx context.Context) error {
-	return withAptLock(func() error {
-		runCtx, cancel := context.WithTimeout(ctx, aptTimeout)
-		defer cancel()
+// aptUpdateLocked refreshes the package index. The caller must already hold
+// the apt lock; aptInstall uses this so it does not deadlock on the mutex.
+func aptUpdateLocked(ctx context.Context) error {
+	runCtx, cancel := context.WithTimeout(ctx, aptTimeout)
+	defer cancel()
 
-		out, err := execOutputCtx(runCtx, "apt-get", "update")
-		if err != nil {
-			return fmt.Errorf("apt-get update: %w: %s", err, out)
-		}
+	out, err := execOutputCtx(runCtx, "apt-get", "update")
+	if err != nil {
+		return fmt.Errorf("apt-get update: %w: %s", err, out)
+	}
 
-		return nil
-	})
+	return nil
 }
 
 // aptInstall installs packages that are not already present. It is a no-op
@@ -120,7 +119,7 @@ func aptInstall(ctx context.Context, pkgs ...string) error {
 			return nil
 		}
 
-		if err := aptUpdate(runCtx); err != nil {
+		if err := aptUpdateLocked(runCtx); err != nil {
 			return err
 		}
 
