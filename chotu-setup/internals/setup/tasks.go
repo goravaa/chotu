@@ -1254,18 +1254,11 @@ func containerLogs(ctx context.Context, container string, lines int) string {
 	return out
 }
 
-// setupStatusPage runs the status container that serves the progress page, so
-// the user can see what the machine is doing while it comes up.
 func setupStatusPage(cfg *config.Config, _ Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if cfg == nil || !cfg.StatusPage.Enabled {
-			slog.Info("status page disabled in config", "component", "status")
+			slog.Info("status page disabled", "component", "status")
 			return nil
-		}
-
-		image := cfg.StatusPage.Image
-		if image == "" {
-			return fmt.Errorf("status_page is enabled but status_page.image is empty")
 		}
 
 		port := cfg.StatusPage.Port
@@ -1273,113 +1266,87 @@ func setupStatusPage(cfg *config.Config, _ Layout) func(context.Context) error {
 			port = 8081
 		}
 
-		if existing, err := run(ctx, "docker", "inspect", "--format",
-			"{{.Config.Image}} {{.State.Running}}", statusContainerName); err == nil {
-			fields := strings.Fields(existing)
-
-			if len(fields) == 2 && fields[0] == image && fields[1] == "true" {
-				if statusPageResponds(ctx, port) {
-					slog.Info(
-						"status page already running",
-						"component", "status",
-						"image", image,
-						"port", port,
-					)
-					return nil
-				}
-
-				slog.Warn(
-					"status container is running but page is not responding",
-					"component", "status",
-					"image", image,
-					"port", port,
-				)
-			}
-
-			slog.Info(
-				"removing existing status container",
-				"component", "status",
-				"container", statusContainerName,
-			)
-
-			if _, err := run(ctx, "docker", "rm", "-f", statusContainerName); err != nil {
-				return fmt.Errorf("remove the old status container: %w", err)
-			}
-		}
+		const service = "chotu-status.service"
 
 		slog.Info(
-			"pulling status page image",
+			"checking status service",
 			"component", "status",
-			"image", image,
-		)
-
-		pullCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-		defer cancel()
-
-		if out, err := execOutputCtx(pullCtx, "docker", "pull", image); err != nil {
-			return fmt.Errorf(
-				"pull the status image %s: %w: %s",
-				image,
-				err,
-				strings.TrimSpace(out),
-			)
-		}
-
-		runCtx, cancelRun := context.WithTimeout(ctx, 2*time.Minute)
-		defer cancelRun()
-
-		args := []string{
-			"run", "-d",
-			"--name", statusContainerName,
-			"--restart", "unless-stopped",
-			"-p", fmt.Sprintf("%d:8081", port),
-		}
-
-		for _, mount := range []string{
-			"/:/host:ro,rslave",
-			"/var/run/docker.sock:/var/run/docker.sock:ro",
-		} {
-			if isDir(strings.Split(mount, ":")[0]) {
-				args = append(args, "-v", mount)
-			}
-		}
-
-		args = append(args, image)
-
-		slog.Info(
-			"starting status page container",
-			"component", "status",
-			"container", statusContainerName,
-			"image", image,
+			"service", service,
 			"port", port,
 		)
 
-		if out, err := execOutputCtx(runCtx, "docker", args...); err != nil {
-			return fmt.Errorf(
-				"start the status container: %w: %s",
-				err,
-				strings.TrimSpace(out),
+		// Check whether the service is currently running.
+		if _, err := run(ctx, "systemctl", "is-active", "--quiet", service); err == nil {
+			slog.Debug(
+				"status service is running",
+				"component", "status",
+				"service", service,
+			)
+
+			// Service is running, so verify that the HTTP endpoint is
+			// actually responding.
+			if statusPageResponds(ctx, port) {
+				slog.Info(
+					"status page ready",
+					"component", "status",
+					"service", service,
+					"port", port,
+				)
+				return nil
+			}
+
+			slog.Warn(
+				"status service is running but status page is not responding; restarting service",
+				"component", "status",
+				"service", service,
+				"port", port,
+			)
+		} else {
+			slog.Warn(
+				"status service is not running; restarting service",
+				"component", "status",
+				"service", service,
 			)
 		}
 
-		slog.Debug(
-			"waiting for status page to respond",
+		// Service was either not running or was unhealthy.
+		if out, err := execOutputCtx(ctx, "systemctl", "restart", service); err != nil {
+			slog.Error(
+				"failed to restart status service",
+				"component", "status",
+				"service", service,
+				"error", err,
+				"output", strings.TrimSpace(out),
+			)
+
+			return fmt.Errorf("restart status service: %w", err)
+		}
+
+		slog.Info(
+			"status service restarted; checking status page",
 			"component", "status",
+			"service", service,
 			"port", port,
 		)
 
 		if !statusPageResponds(ctx, port) {
+			slog.Error(
+				"status page is not responding after service restart",
+				"component", "status",
+				"service", service,
+				"port", port,
+			)
+
 			return fmt.Errorf(
-				"the status container is running but %s did not respond; the image may be "+
-					"wrong or may not be the Chotu status service",
-				fmt.Sprintf("http://127.0.0.1:%d/", port),
+				"status service is running but status page at http://127.0.0.1:%d/ is not responding after restart",
+				port,
 			)
 		}
 
 		slog.Info(
-			"status page ready",
+			"status page ready after service restart",
 			"component", "status",
-			"image", image,
+			"service", service,
 			"port", port,
 		)
 
