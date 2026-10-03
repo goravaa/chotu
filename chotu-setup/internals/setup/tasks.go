@@ -80,7 +80,7 @@ func Tasks(cfg *config.Config) []*Task {
 		},
 		{
 			Name:         TaskDocker,
-			Dependencies: []string{TaskStatus, TaskMachine},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskStorage},
 			Run:          setupDocker(cfg, layout),
 		},
 		{
