@@ -6,6 +6,8 @@
 #   - status-service
 #   - chotu-setup
 #
+# status-service must be running before chotu-setup starts.
+#
 # Bootstrap does not build binaries.
 #
 
@@ -103,7 +105,8 @@ install_setup_daemon() {
     cat > /etc/systemd/system/chotu-setup.service <<EOF
 [Unit]
 Description=Chotu Setup Daemon
-After=network.target
+After=network.target chotu-status.service
+Requires=chotu-status.service
 
 [Service]
 Type=simple
@@ -132,9 +135,11 @@ main() {
 
     log "Chotu bootstrap ${CHOTU_BOOTSTRAP_VERSION}"
 
+    # Download both binaries before starting either service.
     install_status_service
     install_chotu_setup
 
+    # status-service must be running before chotu-setup.
     install_status_service_daemon
     install_setup_daemon
 
