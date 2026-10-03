@@ -2,18 +2,23 @@
 #
 # Chotu bootstrap.
 #
-# This step only prepares Docker and starts the status-service.
-# The chotu-setup daemon is built and installed separately with its Makefile.
+# Downloads and starts the two Chotu daemons:
+#   - status-service
+#   - chotu-setup
+#
+# Bootstrap does not build binaries.
 #
 
 set -Eeuo pipefail
 
 readonly CHOTU_BOOTSTRAP_VERSION="0.1.0"
-
-readonly STATUS_IMAGE="${STATUS_IMAGE:-garvw/chotu-status-service:2026-10-01}"
-readonly STATUS_CONTAINER="${STATUS_CONTAINER:-chotu-status}"
-readonly STATUS_PORT="${STATUS_PORT:-8081}"
 readonly CHOTU_LOG_FILE="/var/log/chotu-bootstrap.log"
+
+readonly STATUS_BINARY="/usr/local/bin/status-service"
+readonly SETUP_BINARY="/usr/local/bin/chotu-setup"
+
+readonly STATUS_BINARY_URL="${STATUS_BINARY_URL:-https://example.com/status-service}"
+readonly SETUP_BINARY_URL="${SETUP_BINARY_URL:-https://example.com/chotu-setup}"
 
 log() {
     printf '[%s] %s\n' "$(date -Is)" "$*" | tee -a "${CHOTU_LOG_FILE}"
@@ -30,62 +35,93 @@ need_root() {
     fi
 }
 
-install_docker() {
-    if command -v docker >/dev/null 2>&1; then
-        log "Docker is already installed"
-        return
-    fi
+download_binary() {
+    local url="$1"
+    local destination="$2"
+    local name="$3"
 
-    log "Installing Docker"
+    log "Downloading ${name}"
 
-    apt-get update
-    apt-get install -y docker.io
+    curl \
+        --fail \
+        --silent \
+        --show-error \
+        --location \
+        --output "${destination}" \
+        "${url}" ||
+        die "Failed to download ${name} from ${url}"
 
-    systemctl enable --now docker
+    chmod +x "${destination}"
 
-    command -v docker >/dev/null 2>&1 ||
-        die "Docker installation failed"
-
-    log "Docker installed successfully"
+    log "${name} installed at ${destination}"
 }
 
-start_docker() {
-    log "Starting Docker"
-
-    systemctl enable --now docker
-
-    systemctl is-active --quiet docker ||
-        die "Docker service is not running"
+install_status_service() {
+    download_binary \
+        "${STATUS_BINARY_URL}" \
+        "${STATUS_BINARY}" \
+        "status-service"
 }
 
-run_status_service() {
-    log "Pulling status service image: ${STATUS_IMAGE}"
+install_chotu_setup() {
+    download_binary \
+        "${SETUP_BINARY_URL}" \
+        "${SETUP_BINARY}" \
+        "chotu-setup"
+}
 
-    docker pull "${STATUS_IMAGE}"
+install_status_service_daemon() {
+    log "Installing status-service systemd service"
 
-    if docker container inspect "${STATUS_CONTAINER}" >/dev/null 2>&1; then
-        log "Removing existing ${STATUS_CONTAINER} container"
-        docker rm -f "${STATUS_CONTAINER}" >/dev/null
-    fi
+    cat > /etc/systemd/system/chotu-status.service <<EOF
+[Unit]
+Description=Chotu Status Service
+After=network.target
 
-    log "Starting status service on port ${STATUS_PORT}"
+[Service]
+Type=simple
+ExecStart=${STATUS_BINARY}
+Restart=always
+RestartSec=2
 
-    docker run -d \
-        --name "${STATUS_CONTAINER}" \
-        --restart unless-stopped \
-        -p "${STATUS_PORT}:${STATUS_PORT}" \
-        "${STATUS_IMAGE}" >/dev/null
+[Install]
+WantedBy=multi-user.target
+EOF
 
-    sleep 2
+    systemctl daemon-reload
+    systemctl enable --now chotu-status.service
 
-    if ! docker ps --filter "name=^/${STATUS_CONTAINER}$" --filter "status=running" --format '{{.Names}}' |
-        grep -qx "${STATUS_CONTAINER}"; then
-        log "Status service failed to start"
-        docker logs "${STATUS_CONTAINER}" || true
-        die "Status service container is not running"
-    fi
+    systemctl is-active --quiet chotu-status.service ||
+        die "status-service failed to start"
 
-    log "Status service is running"
+    log "status-service daemon is running"
+}
+
+install_setup_daemon() {
+    log "Installing chotu-setup systemd service"
+
+    cat > /etc/systemd/system/chotu-setup.service <<EOF
+[Unit]
+Description=Chotu Setup Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${SETUP_BINARY}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now chotu-setup.service
+
+    systemctl is-active --quiet chotu-setup.service ||
+        die "chotu-setup failed to start"
+
+    log "chotu-setup daemon is running"
 }
 
 main() {
@@ -96,14 +132,13 @@ main() {
 
     log "Chotu bootstrap ${CHOTU_BOOTSTRAP_VERSION}"
 
-    install_docker
-    start_docker
-    run_status_service
+    install_status_service
+    install_chotu_setup
+
+    install_status_service_daemon
+    install_setup_daemon
 
     log "Bootstrap complete"
-    log "Status service: ${STATUS_IMAGE}"
-    log "Status service port: ${STATUS_PORT}"
-    log "Chotu setup can now be installed separately with its Makefile"
 }
 
 main "$@"
