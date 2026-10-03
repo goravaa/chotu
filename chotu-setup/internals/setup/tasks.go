@@ -85,7 +85,7 @@ func Tasks(cfg *config.Config) []*Task {
 		},
 		{
 			Name:         TaskGPU,
-			Dependencies: []string{TaskStatus, TaskMachine},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskStorage},
 			Run:          setupGPU(cfg, layout),
 		},
 		{
