@@ -110,7 +110,7 @@ func Tasks(cfg *config.Config) []*Task {
 		},
 		{
 			Name:         TaskWorkspace,
-			Dependencies: []string{TaskStatus, TaskMachine, TaskStorage, TaskTooling},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskStorage},
 			Run:          setupWorkspace(cfg, layout),
 		},
 		{
