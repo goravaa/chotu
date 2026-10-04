@@ -113,5 +113,4 @@ tooling:
     - htop
     - nvtop
     - python3.14
-    - go1.22.0
-
+    - golang-go
