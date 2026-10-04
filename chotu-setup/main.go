@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -155,6 +156,9 @@ func run() int {
 	)
 
 	if *once {
+		collector := publish.NewCollector()
+		cycles := 1
+
 		report, err := runCycle(
 			ctx,
 			db,
@@ -162,13 +166,14 @@ func run() int {
 			setup.Tasks,
 			*attempts,
 			*retryDelay,
+			liveProgress(ctx, collector, cycles),
 		)
 		if err != nil {
 			slog.Error("setup cycle failed", "error", err)
 			return 1
 		}
 
-		publishStatus(ctx, publish.NewCollector(), report, 1)
+		publishStatus(ctx, collector, report, cycles)
 
 		if failed := report.failed(); len(failed) > 0 {
 			return 1
@@ -220,15 +225,15 @@ func runDaemon(
 			tasksFor,
 			attempts,
 			retryDelay,
+			liveProgress(ctx, collector, cycles),
 		)
 		if err != nil {
 			slog.Error("setup cycle error", "cycle", cycles, "error", err)
 		}
 
-		// Publish after every cycle, including a failed one. The user watching
-		// the page during a slow first boot is exactly who needs to see which
-		// task is stuck, so a cycle that reports nothing is the one case where
-		// staying quiet is wrong.
+		// Publish after every cycle, including a failed one. Mid-cycle
+		// publishes already keep the page live; this final document pins the
+		// terminal machine state (READY/FAILED) and the full cycle duration.
 		if cycle != nil {
 			publishStatus(ctx, collector, cycle, cycles)
 		}
@@ -273,14 +278,50 @@ func (r *cycleReport) failed() []string {
 	return failed
 }
 
-// publishStatus sends the cycle's outcome to the status service. The publisher
-// is built per cycle from the config that cycle used, so a port change in
+// liveProgress returns a hook that publishes INITIALIZING documents as the
+// task graph advances. Without this the status page stays on the previous
+// cycle (or empty) for the whole first boot while gpu/vllm run for minutes.
+//
+// Publishes are serialised: the runner fires progress from many goroutines,
+// and a single in-flight Collect+POST is enough to keep the page honest.
+func liveProgress(
+	ctx context.Context,
+	collector *publish.Collector,
+	cycles int,
+) func(*config.Config, setup.Layout, map[string]setup.TaskResult, time.Duration) {
+	var mu sync.Mutex
+
+	return func(
+		cfg *config.Config,
+		layout setup.Layout,
+		results map[string]setup.TaskResult,
+		elapsed time.Duration,
+	) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		publishStatus(ctx, collector, &cycleReport{
+			Config:       cfg,
+			Layout:       layout,
+			Results:      results,
+			MachineState: string(state.StateInitializing),
+			Duration:     elapsed,
+		}, cycles)
+	}
+}
+
+// publishStatus sends a status document to the status service. The publisher
+// is built per call from the config that cycle used, so a port change in
 // config.yaml takes effect without a restart.
 //
 // The collector is shared across cycles on purpose. It remembers the previous
 // CPU reading, because utilisation is only a delta; a fresh collector per cycle
 // would report zero forever and make the page useless.
 func publishStatus(ctx context.Context, collector *publish.Collector, report *cycleReport, cycles int) {
+	if collector == nil || report == nil || report.Config == nil {
+		return
+	}
+
 	publisher := publish.NewPublisher(
 		"",
 		report.Config.StatusPage.Port,
@@ -300,6 +341,14 @@ func publishStatus(ctx context.Context, collector *publish.Collector, report *cy
 	publisher.Publish(ctx, document)
 }
 
+// cycleProgress is called as the task graph advances during a cycle.
+type cycleProgress func(
+	cfg *config.Config,
+	layout setup.Layout,
+	results map[string]setup.TaskResult,
+	elapsed time.Duration,
+)
+
 func runCycle(
 	ctx context.Context,
 	db *sql.DB,
@@ -307,6 +356,7 @@ func runCycle(
 	tasksFor func(*config.Config) []*setup.Task,
 	attempts int,
 	retryDelay time.Duration,
+	onProgress cycleProgress,
 ) (*cycleReport, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -349,6 +399,12 @@ func runCycle(
 	runner := setup.NewRunner(tasks, state.NewStore(db)).
 		WithRetryPolicy(attempts, retryDelay)
 
+	if onProgress != nil {
+		runner = runner.WithProgress(func(results map[string]setup.TaskResult) {
+			onProgress(cfg, layout, results, time.Since(started))
+		})
+	}
+
 	results := runner.Run(ctx)
 
 	// A cancelled context means the daemon is shutting down, not that the
@@ -383,6 +439,10 @@ func runCycle(
 	report.Duration = time.Since(started)
 
 	for _, name := range failed {
+		if results[name].State != setup.Failed {
+			continue
+		}
+
 		slog.Error("task failed", "task", name, "error", results[name].Error)
 	}
 

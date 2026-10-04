@@ -105,7 +105,8 @@ func TestRunCycleMarksMachineReady(t *testing.T) {
 		cycleConfig(t, "model-a"),
 		staticTasks(tasks),
 		testAttempts,
-		testRetryDelay)
+		testRetryDelay,
+		nil)
 	if err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
@@ -140,7 +141,8 @@ func TestRunCycleMarksMachineFailed(t *testing.T) {
 		cycleConfig(t, "model-a"),
 		staticTasks(tasks),
 		testAttempts,
-		testRetryDelay)
+		testRetryDelay,
+		nil)
 	if err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
@@ -182,7 +184,8 @@ func TestRunCycleInterruptedDoesNotReportFailure(t *testing.T) {
 		cycleConfig(t, "model-a"),
 		staticTasks(tasks),
 		testAttempts,
-		testRetryDelay)
+		testRetryDelay,
+		nil)
 
 	if err == nil {
 		t.Fatal("expected an error for an interrupted cycle")
@@ -207,7 +210,8 @@ func TestRunCycleRecoversAfterFailure(t *testing.T) {
 		configPath,
 		staticTasks(failing),
 		testAttempts,
-		testRetryDelay); err != nil {
+		testRetryDelay,
+		nil); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -223,7 +227,8 @@ func TestRunCycleRecoversAfterFailure(t *testing.T) {
 		configPath,
 		staticTasks(healthy),
 		testAttempts,
-		testRetryDelay); err != nil {
+		testRetryDelay,
+		nil); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -245,7 +250,8 @@ func TestRunCycleRepeatedCyclesAreIdempotent(t *testing.T) {
 			configPath,
 			staticTasks(tasks),
 			testAttempts,
-			testRetryDelay); err != nil {
+			testRetryDelay,
+			nil); err != nil {
 			t.Fatalf("cycle %d: %v", cycle, err)
 		}
 
@@ -279,7 +285,8 @@ func TestRunCyclePicksUpConfigChange(t *testing.T) {
 		configA,
 		staticTasks(tasks),
 		testAttempts,
-		testRetryDelay); err != nil {
+		testRetryDelay,
+		nil); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -293,7 +300,8 @@ func TestRunCyclePicksUpConfigChange(t *testing.T) {
 		configB,
 		staticTasks(tasks),
 		testAttempts,
-		testRetryDelay); err != nil {
+		testRetryDelay,
+		nil); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -313,7 +321,8 @@ func TestRunCycleMissingConfigIsAnError(t *testing.T) {
 		filepath.Join(t.TempDir(), "absent.yaml"),
 		staticTasks([]*setup.Task{okTask("storage")}),
 		testAttempts,
-		testRetryDelay)
+		testRetryDelay,
+		nil)
 
 	if err == nil {
 		t.Fatal("expected an error for a missing config")

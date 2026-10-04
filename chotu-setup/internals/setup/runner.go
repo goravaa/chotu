@@ -31,12 +31,17 @@ type TaskStateStore interface {
 	SetTaskState(name string, state string, err error) error
 }
 
+// ProgressFunc receives a snapshot of every task's current result whenever the
+// graph advances. Callers use it to publish live status during a long cycle.
+type ProgressFunc func(results map[string]TaskResult)
+
 type Runner struct {
 	tasks map[string]*Task
 	store TaskStateStore
 
 	attempts   int
 	retryDelay time.Duration
+	onProgress ProgressFunc
 }
 
 func NewRunner(tasks []*Task, store TaskStateStore) *Runner {
@@ -68,17 +73,32 @@ func (r *Runner) WithRetryPolicy(attempts int, delay time.Duration) *Runner {
 	return r
 }
 
+// WithProgress registers a callback invoked after each task state change,
+// including the initial PENDING seed. The callback must not block for long:
+// it runs on the task goroutine that just recorded the change.
+func (r *Runner) WithProgress(fn ProgressFunc) *Runner {
+	r.onProgress = fn
+	return r
+}
+
 func (r *Runner) Run(ctx context.Context) map[string]TaskResult {
-	results := make(map[string]TaskResult)
+	results := make(map[string]TaskResult, len(r.tasks))
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	done := make(map[string]chan struct{})
+	done := make(map[string]chan struct{}, len(r.tasks))
 
 	for name := range r.tasks {
 		done[name] = make(chan struct{})
+		results[name] = TaskResult{State: Pending}
+
+		if storeErr := r.updateTaskState(name, Pending, nil); storeErr != nil {
+			slog.Error("failed to persist state", "task", name, "state", Pending, "error", storeErr)
+		}
 	}
+
+	r.notifyProgress(results, &mu)
 
 	for _, task := range r.tasks {
 		wg.Add(1)
@@ -116,6 +136,8 @@ func (r *Runner) runTask(
 		if storeErr := r.updateTaskState(task.Name, state, err); storeErr != nil {
 			slog.Error("failed to persist state", "task", task.Name, "state", state, "error", storeErr)
 		}
+
+		r.notifyProgress(results, mu)
 	}
 
 	// A panic in a task would otherwise terminate the whole process, since Go
@@ -141,7 +163,7 @@ func (r *Runner) runTask(
 			slog.Error("dependency wait failed", "task", task.Name, "error", err)
 		}
 
-		record(Failed, err)
+		record(Blocked, err)
 
 		return
 	}
@@ -159,6 +181,21 @@ func (r *Runner) runTask(
 
 	slog.Info("task completed", "task", task.Name, "state", "completed")
 	record(Completed, nil)
+}
+
+func (r *Runner) notifyProgress(results map[string]TaskResult, mu *sync.Mutex) {
+	if r.onProgress == nil {
+		return
+	}
+
+	mu.Lock()
+	snapshot := make(map[string]TaskResult, len(results))
+	for name, result := range results {
+		snapshot[name] = result
+	}
+	mu.Unlock()
+
+	r.onProgress(snapshot)
 }
 
 // runWithRetries runs the task, retrying transient failures and panics with

@@ -88,7 +88,10 @@ func buildSetup(opts Options) status.Setup {
 			Message: message,
 		}
 
-		if result.State != setup.Completed {
+		// Only root failures belong in Failed. Blocked dependents are still in
+		// Tasks with their dependency message, but listing them here would hide
+		// the real cause behind a cascade of "did not complete" noise.
+		if result.State == setup.Failed {
 			setupReport.Failed = append(setupReport.Failed, name)
 		}
 	}
@@ -180,22 +183,23 @@ func collectSync(ctx context.Context) status.Sync {
 			case "ExecMainStatus":
 				if value == "0" {
 					sync.State = "healthy"
-					sync.LastSuccess = sync.LastAttempt
 				} else if value != "" {
 					sync.Message = "last run exited " + value
 				}
 			case "ExecMainExitTimestamp":
-				sync.LastSuccess = value
+				// Exit timestamp is the last attempt. Only a successful run
+				// promotes it to LastSuccess; a failed run must not look like
+				// a successful sync on the status page.
+				sync.LastAttempt = value
+				if sync.State == "healthy" {
+					sync.LastSuccess = value
+				}
 			case "Result":
 				if value != "" && value != "success" {
 					sync.Message = "result: " + value
 				}
 			}
 		}
-	}
-
-	if sync.LastAttempt == "" {
-		sync.LastAttempt = sync.LastSuccess
 	}
 
 	return sync
