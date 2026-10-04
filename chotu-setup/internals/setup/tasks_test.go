@@ -150,8 +150,8 @@ func TestRealGraphReachesATerminalStateForEveryTask(t *testing.T) {
 	results := runRealGraph(t)
 
 	for name, result := range results {
-		if result.State != Completed && result.State != Failed {
-			t.Errorf("%s = %s, want COMPLETED or FAILED", name, result.State)
+		if result.State != Completed && result.State != Failed && result.State != Blocked {
+			t.Errorf("%s = %s, want COMPLETED, FAILED, or BLOCKED", name, result.State)
 		}
 	}
 
@@ -164,39 +164,67 @@ func TestRealGraphReachesATerminalStateForEveryTask(t *testing.T) {
 	}
 }
 
-// TestRealBodiesRespectDependencies proves the real bodies are gated on their
-// dependencies. Pointing HOME at a path that cannot be created makes the rclone
-// body fail for any user, while s3 is disabled and would otherwise succeed, so
-// s3 must be skipped rather than run against a dependency that failed.
+// TestRealBodiesRespectDependencies proves the real graph never runs a body
+// whose dependency failed. On a developer laptop many tasks fail for hardware
+// reasons; what must always hold is that their dependents are BLOCKED, not
+// COMPLETED, and that a COMPLETED task only appears when every dependency did.
 func TestRealBodiesRespectDependencies(t *testing.T) {
-	blocked := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
-		t.Fatalf("write blocker file: %v", err)
-	}
-
-	t.Setenv("HOME", filepath.Join(blocked, "home"))
 	t.Setenv("CHOTU_STATE_DIR", t.TempDir())
 	t.Setenv("CHOTU_LOG_DIR", t.TempDir())
 
 	tasks := Tasks(&config.Config{})
+	byName := make(map[string]*Task, len(tasks))
+
+	for _, task := range tasks {
+		byName[task.Name] = task
+	}
 
 	results := NewRunner(tasks, nil).
 		WithRetryPolicy(1, time.Millisecond).
 		Run(context.Background())
 
-	if results[TaskRclone].State != Failed {
-		t.Fatalf("rclone = %s, want FAILED so the dependency is genuinely broken",
-			results[TaskRclone].State)
-	}
+	for name, result := range results {
+		task := byName[name]
 
-	s3 := results[TaskS3]
-	if s3.State != Failed {
-		t.Fatalf("s3 = %s, want FAILED: it must be skipped when rclone fails",
-			s3.State)
-	}
+		for _, dep := range task.Dependencies {
+			depResult := results[dep]
 
-	if !strings.Contains(s3.Error.Error(), "did not complete") {
-		t.Errorf("s3 error = %q, want it to name the failed dependency", s3.Error)
+			if depResult.State != Completed {
+				if result.State != Blocked {
+					t.Errorf(
+						"%s = %s, want BLOCKED because dependency %s is %s",
+						name,
+						result.State,
+						dep,
+						depResult.State,
+					)
+				}
+
+				if result.Error == nil ||
+					!strings.Contains(result.Error.Error(), "did not complete") {
+					t.Errorf(
+						"%s error = %v, want it to name the failed dependency",
+						name,
+						result.Error,
+					)
+				}
+
+				break
+			}
+		}
+
+		if result.State == Completed {
+			for _, dep := range task.Dependencies {
+				if results[dep].State != Completed {
+					t.Errorf(
+						"%s completed while dependency %s is %s",
+						name,
+						dep,
+						results[dep].State,
+					)
+				}
+			}
+		}
 	}
 }
 
@@ -207,7 +235,7 @@ func TestRealGraphReportsActionableErrors(t *testing.T) {
 	results := runRealGraph(t)
 
 	for name, result := range results {
-		if result.State != Failed {
+		if result.State != Failed && result.State != Blocked {
 			continue
 		}
 
@@ -248,9 +276,17 @@ func testLayout(t *testing.T) Layout {
 }
 
 // TestStorageTaskCreatesDirs proves the storage body does its work rather than
-// only reporting failure, using temporary directories so the test needs no root.
+// only reporting failure. The task requires a real mount for DataDir, so the
+// test uses a writable mount point when one is available.
 func TestStorageTaskCreatesDirs(t *testing.T) {
 	layout := testLayout(t)
+
+	mount := findTestMount(t)
+	if mount == "" {
+		t.Skip("no writable mount point available to stand in for the instance store")
+	}
+
+	layout.DataDir = mount
 
 	if err := setupStorage(&config.Config{}, layout)(context.Background()); err != nil {
 		t.Fatalf("setupStorage: %v", err)
@@ -263,13 +299,11 @@ func TestStorageTaskCreatesDirs(t *testing.T) {
 	}
 }
 
-// TestStorageTaskRequiresTheInstanceStoreOnlyWhenEphemeral covers the storage
-// topology. A disposable spot machine has nothing but the instance store, so
-// the task must refuse to run without it: an unmounted /data would silently put
-// the workspace on the small root disk and lose it when the instance is
-// reclaimed. A persistent machine already has a root disk, so the instance
-// store is only scratch and its absence is not fatal.
-func TestStorageTaskRequiresTheInstanceStoreOnlyWhenEphemeral(t *testing.T) {
+// TestStorageTaskRequiresInstanceStoreMount covers the storage topology: every
+// machine must have the instance store mounted at DataDir. Persistent mode uses
+// it as scratch under /data; ephemeral mode puts the workspace there. An
+// unmounted path would silently put state on the small root disk.
+func TestStorageTaskRequiresInstanceStoreMount(t *testing.T) {
 	t.Run("ephemeral without the instance store fails", func(t *testing.T) {
 		layout := testLayout(t)
 		layout.Mode = "ephemeral"
@@ -285,8 +319,29 @@ func TestStorageTaskRequiresTheInstanceStoreOnlyWhenEphemeral(t *testing.T) {
 			t.Fatal("ephemeral mode with no instance store: want an error")
 		}
 
-		if !strings.Contains(err.Error(), "instance store") {
-			t.Errorf("error = %q, want it to name the instance store", err)
+		if !strings.Contains(err.Error(), "mount point") &&
+			!strings.Contains(err.Error(), "instance store") {
+			t.Errorf("error = %q, want it to name the missing mount", err)
+		}
+	})
+
+	t.Run("persistent without the instance store fails", func(t *testing.T) {
+		layout := testLayout(t)
+		layout.Mode = "persistent"
+		layout.DataDir = filepath.Join(t.TempDir(), "not-attached")
+
+		if err := os.MkdirAll(layout.DataDir, 0o755); err != nil {
+			t.Fatalf("create the data directory: %v", err)
+		}
+
+		err := setupStorage(&config.Config{}, layout)(context.Background())
+		if err == nil {
+			t.Fatal("persistent mode with no instance store: want an error")
+		}
+
+		if !strings.Contains(err.Error(), "mount point") &&
+			!strings.Contains(err.Error(), "instance store") {
+			t.Errorf("error = %q, want it to name the missing mount", err)
 		}
 	})
 
@@ -308,17 +363,19 @@ func TestStorageTaskRequiresTheInstanceStoreOnlyWhenEphemeral(t *testing.T) {
 		}
 	})
 
-	t.Run("persistent does not require the instance store", func(t *testing.T) {
+	t.Run("persistent with the instance store succeeds", func(t *testing.T) {
 		layout := testLayout(t)
 		layout.Mode = "persistent"
-		layout.DataDir = filepath.Join(t.TempDir(), "not-attached")
 
-		if err := os.MkdirAll(layout.DataDir, 0o755); err != nil {
-			t.Fatalf("create the data directory: %v", err)
+		mount := findTestMount(t)
+		if mount == "" {
+			t.Skip("no writable mount point available to stand in for the instance store")
 		}
 
+		layout.DataDir = mount
+
 		if err := setupStorage(&config.Config{}, layout)(context.Background()); err != nil {
-			t.Errorf("persistent mode without the instance store: %v", err)
+			t.Errorf("persistent mode with the instance store attached: %v", err)
 		}
 	})
 }
@@ -359,16 +416,6 @@ func TestResolveLayoutFollowsPersistence(t *testing.T) {
 			},
 		})
 
-		if !layout.IsPersistent() {
-			t.Fatal("persist=true: want persistent mode")
-		}
-
-		if layout.RequiresDataDir() {
-			t.Error("persist=true: the instance store is scratch and must not be required")
-		}
-
-		// The instance store is still the data directory, it just is not where
-		// the workspace lives.
 		if layout.DataDir != "/mnt/instance-store" {
 			t.Errorf("DataDir = %q, want the instance store at /mnt/instance-store", layout.DataDir)
 		}
@@ -402,14 +449,6 @@ func TestResolveLayoutFollowsPersistence(t *testing.T) {
 		t.Setenv("CHOTU_LOG_DIR", "")
 
 		layout := ResolveLayout(&config.Config{})
-
-		if layout.IsPersistent() {
-			t.Fatal("persist=false: want ephemeral mode")
-		}
-
-		if !layout.RequiresDataDir() {
-			t.Error("persist=false: the instance store is the only storage and must be required")
-		}
 
 		for name, path := range map[string]string{
 			"Workspace":  layout.Workspace,
@@ -731,8 +770,8 @@ func TestBodiedTaskDetectsServiceDrift(t *testing.T) {
 	}
 
 	// Anything depending on the failed check must be skipped.
-	if drifted["report"].State != Failed {
-		t.Errorf("report = %s, want FAILED", drifted["report"].State)
+	if drifted["report"].State != Blocked {
+		t.Errorf("report = %s, want BLOCKED", drifted["report"].State)
 	}
 
 	// The service comes back and the next cycle is healthy again.

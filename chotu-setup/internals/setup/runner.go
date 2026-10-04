@@ -3,7 +3,7 @@ package setup
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -31,12 +31,17 @@ type TaskStateStore interface {
 	SetTaskState(name string, state string, err error) error
 }
 
+// ProgressFunc receives a snapshot of every task's current result whenever the
+// graph advances. Callers use it to publish live status during a long cycle.
+type ProgressFunc func(results map[string]TaskResult)
+
 type Runner struct {
 	tasks map[string]*Task
 	store TaskStateStore
 
 	attempts   int
 	retryDelay time.Duration
+	onProgress ProgressFunc
 }
 
 func NewRunner(tasks []*Task, store TaskStateStore) *Runner {
@@ -68,17 +73,32 @@ func (r *Runner) WithRetryPolicy(attempts int, delay time.Duration) *Runner {
 	return r
 }
 
+// WithProgress registers a callback invoked after each task state change,
+// including the initial PENDING seed. The callback must not block for long:
+// it runs on the task goroutine that just recorded the change.
+func (r *Runner) WithProgress(fn ProgressFunc) *Runner {
+	r.onProgress = fn
+	return r
+}
+
 func (r *Runner) Run(ctx context.Context) map[string]TaskResult {
-	results := make(map[string]TaskResult)
+	results := make(map[string]TaskResult, len(r.tasks))
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	done := make(map[string]chan struct{})
+	done := make(map[string]chan struct{}, len(r.tasks))
 
 	for name := range r.tasks {
 		done[name] = make(chan struct{})
+		results[name] = TaskResult{State: Pending}
+
+		if storeErr := r.updateTaskState(name, Pending, nil); storeErr != nil {
+			slog.Error("failed to persist state", "task", name, "state", Pending, "error", storeErr)
+		}
 	}
+
+	r.notifyProgress(results, &mu)
 
 	for _, task := range r.tasks {
 		wg.Add(1)
@@ -114,13 +134,10 @@ func (r *Runner) runTask(
 		mu.Unlock()
 
 		if storeErr := r.updateTaskState(task.Name, state, err); storeErr != nil {
-			log.Printf(
-				"task %s: failed to persist state %s: %v",
-				task.Name,
-				state,
-				storeErr,
-			)
+			slog.Error("failed to persist state", "task", task.Name, "state", state, "error", storeErr)
 		}
+
+		r.notifyProgress(results, mu)
 	}
 
 	// A panic in a task would otherwise terminate the whole process, since Go
@@ -134,28 +151,24 @@ func (r *Runner) runTask(
 
 		stack := string(debug.Stack())
 
-		log.Printf(
-			"task %s: panic recovered: %v\n%s",
-			task.Name,
-			rec,
-			stack,
-		)
+		slog.Error("task panic recovered", "task", task.Name, "panic", rec, "stack", stack)
 
 		record(Failed, fmt.Errorf("panic: %v", rec))
 	}()
 
 	if err := r.waitForDependencies(ctx, task, done, results, mu); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			log.Printf("task %s: interrupted while waiting for dependencies", task.Name)
+			slog.Error("interrupted while waiting for dependencies", "task", task.Name)
 		} else {
-			log.Printf("task %s: %v", task.Name, err)
+			slog.Error("dependency wait failed", "task", task.Name, "error", err)
 		}
 
-		record(Failed, err)
+		record(Blocked, err)
 
 		return
 	}
 
+	slog.Info("task started", "task", task.Name, "state", "running")
 	record(Running, nil)
 
 	err := r.runWithRetries(ctx, task)
@@ -166,7 +179,23 @@ func (r *Runner) runTask(
 		return
 	}
 
+	slog.Info("task completed", "task", task.Name, "state", "completed")
 	record(Completed, nil)
+}
+
+func (r *Runner) notifyProgress(results map[string]TaskResult, mu *sync.Mutex) {
+	if r.onProgress == nil {
+		return
+	}
+
+	mu.Lock()
+	snapshot := make(map[string]TaskResult, len(results))
+	for name, result := range results {
+		snapshot[name] = result
+	}
+	mu.Unlock()
+
+	r.onProgress(snapshot)
 }
 
 // runWithRetries runs the task, retrying transient failures and panics with
@@ -186,7 +215,7 @@ func (r *Runner) runWithRetries(ctx context.Context, task *Task) error {
 
 		if err == nil {
 			if attempt > 1 {
-				log.Printf("task %s: succeeded on attempt %d/%d", task.Name, attempt, attempts)
+				slog.Info("task succeeded on retry", "task", task.Name, "attempt", attempt, "max_attempts", attempts)
 			}
 
 			return nil
@@ -197,24 +226,12 @@ func (r *Runner) runWithRetries(ctx context.Context, task *Task) error {
 		}
 
 		if attempt >= attempts {
-			log.Printf(
-				"task %s: failed after %d attempt(s): %v",
-				task.Name,
-				attempt,
-				err,
-			)
+			slog.Error("task failed after all attempts", "task", task.Name, "attempts", attempt, "error", err)
 
 			return err
 		}
 
-		log.Printf(
-			"task %s: attempt %d/%d failed: %v; retrying in %s",
-			task.Name,
-			attempt,
-			attempts,
-			err,
-			delay,
-		)
+		slog.Warn("task attempt failed", "task", task.Name, "attempt", attempt, "max_attempts", attempts, "error", err, "retry_delay", delay)
 
 		select {
 		case <-ctx.Done():
@@ -241,12 +258,7 @@ func (r *Runner) runGuarded(ctx context.Context, task *Task) (err error) {
 
 		err = fmt.Errorf("panic: %v", rec)
 
-		log.Printf(
-			"task %s: panic recovered: %v\n%s",
-			task.Name,
-			rec,
-			debug.Stack(),
-		)
+		slog.Error("task attempt panic recovered", "task", task.Name, "panic", rec, "stack", string(debug.Stack()))
 	}()
 
 	return task.Run(ctx)

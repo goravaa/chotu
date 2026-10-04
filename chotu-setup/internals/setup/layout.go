@@ -3,23 +3,22 @@ package setup
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/goravaa/chotu/chotu-setup/internals/config"
 )
 
-// The instance store is always mounted at the data directory, in both storage
-// modes. What changes is whether it is the machine's primary storage or only
-// scratch space.
+// The instance store is always mounted at the data directory.
+//
+// In persistent mode it is scratch space.
+// In ephemeral mode it is the machine's primary storage.
 const defaultDataDir = "/data"
 
-// Paths on the root disk, used when persistence is on. They are spelled out in
-// full rather than joined onto a configurable root, because there is exactly one
-// root disk and a partially applied relocation is worse than none.
 const (
 	rootDiskDockerRoot = "/var/lib/docker"
 	rootDiskModelCache = "/var/lib/chotu/huggingface"
@@ -37,8 +36,8 @@ type Layout struct {
 	DataDir string
 
 	// RunUser is the unprivileged user the machine is prepared for. Chotu runs
-	// as root because it installs system packages, but the workspace belongs to
-	// this user.
+	// as root because it installs system packages, but the workspace belongs
+	// to this user.
 	RunUser string
 
 	// Home is RunUser's home directory.
@@ -53,39 +52,28 @@ type Layout struct {
 	Workspace  string
 }
 
-// IsPersistent reports whether the machine keeps its state on a disk that
-// outlives the instance.
-func (l Layout) IsPersistent() bool { return l.Mode == "persistent" }
-
-// RequiresDataDir reports whether the instance store must be attached.
-//
-// A disposable spot machine has no other choice: the instance store is where
-// the workspace and the Docker root live, so without it there is nothing to
-// run on. A persistent machine already has a root disk, so the instance store
-// is an optimisation and its absence is only worth reporting.
-func (l Layout) RequiresDataDir() bool { return !l.IsPersistent() }
-
 // ResolveLayout turns the config into the concrete paths the tasks use.
 func ResolveLayout(cfg *config.Config) Layout {
 	persist := cfg != nil && cfg.Machine.Storage.Persist
 	runUser, home := resolveRunUser()
 
 	layout := Layout{
-		Mode:     "ephemeral",
-		DataDir:  envOr("CHOTU_DATA_DIR", defaultDataDir),
-		RunUser:  runUser,
-		Home:     home,
-		StateDir: rootDiskStateDir,
+		Mode:    "ephemeral",
+		DataDir: envOr("CHOTU_DATA_DIR", defaultDataDir),
+		RunUser: runUser,
+		Home:    home,
 	}
 
 	if persist {
 		layout.Mode = "persistent"
 
+		// Root disk is primary storage. /data is scratch.
 		layout.DockerRoot = rootDiskDockerRoot
 		layout.ModelCache = rootDiskModelCache
 		layout.StateDir = rootDiskStateDir
 		layout.Workspace = filepath.Join(home, "workspace")
 	} else {
+		// Instance store is primary storage.
 		layout.DockerRoot = filepath.Join(layout.DataDir, "docker")
 		layout.ModelCache = filepath.Join(layout.DataDir, "huggingface")
 		layout.StateDir = filepath.Join(layout.DataDir, "chotu")
@@ -178,12 +166,67 @@ func ensureDir(path string, owner string) (bool, error) {
 	}
 
 	if owner != "" && isRoot() {
-		if err := chownRecursive(path, owner); err != nil {
+		owned, err := dirOwnedBy(path, owner)
+		if err != nil {
 			return created, err
+		}
+
+		// Only chown when the top-level owner is wrong. A recursive chown on
+		// every cycle would thrash a large model cache for no reason.
+		if !owned {
+			if err := chownRecursive(path, owner); err != nil {
+				return created, err
+			}
+
+			return true, nil
 		}
 	}
 
 	return created, nil
+}
+
+// dirOwnedBy reports whether path is owned by user:user.
+func dirOwnedBy(path, owner string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, nil
+	}
+
+	uid, gid, err := userIDs(owner)
+	if err != nil {
+		return false, err
+	}
+
+	return stat.Uid == uid && stat.Gid == gid, nil
+}
+
+func userIDs(name string) (uid, gid uint32, err error) {
+	out, err := execOutput("getent", "passwd", name)
+	if err != nil {
+		return 0, 0, fmt.Errorf("lookup user %s: %w", name, err)
+	}
+
+	fields := strings.Split(strings.TrimSpace(out), ":")
+	if len(fields) < 4 {
+		return 0, 0, fmt.Errorf("lookup user %s: malformed passwd entry", name)
+	}
+
+	parsedUID, err := strconv.ParseUint(fields[2], 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("lookup user %s: bad uid %q: %w", name, fields[2], err)
+	}
+
+	parsedGID, err := strconv.ParseUint(fields[3], 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("lookup user %s: bad gid %q: %w", name, fields[3], err)
+	}
+
+	return uint32(parsedUID), uint32(parsedGID), nil
 }
 
 func chownRecursive(path, user string) error {
@@ -199,9 +242,8 @@ func chownRecursive(path, user string) error {
 // that happens to exist on the root filesystem.
 //
 // os.Stat alone cannot tell the two apart, and the difference is the whole
-// point of the instance store: on a spot machine an unmounted /data silently
-// means the workspace lands on the small root disk and is lost when the
-// instance is reclaimed.
+// point of the instance store: on an ephemeral machine an unmounted /data
+// silently means the workspace lands on the root disk.
 func isMountpoint(path string) (bool, error) {
 	var target, parent syscall.Stat_t
 
@@ -251,10 +293,19 @@ func mountInfo(path string) string {
 func logLayout(layout Layout) {
 	mounted, _ := isMountpoint(layout.DataDir)
 
-	log.Printf("[storage] mode=%s", layout.Mode)
-	log.Printf("[storage] workspace=%s", layout.Workspace)
-	log.Printf("[storage] docker-root=%s", layout.DockerRoot)
-	log.Printf("[storage] model-cache=%s", layout.ModelCache)
-	log.Printf("[storage] state=%s", layout.StateDir)
-	log.Printf("[storage] data=%s (fstype=%s mount=%t)", layout.DataDir, mountInfo(layout.DataDir), mounted)
+	slog.Info(fmt.Sprintf("mode=%s", layout.Mode), "component", "storage")
+	slog.Info(fmt.Sprintf("workspace=%s", layout.Workspace), "component", "storage")
+	slog.Info(fmt.Sprintf("docker-root=%s", layout.DockerRoot), "component", "storage")
+	slog.Info(fmt.Sprintf("model-cache=%s", layout.ModelCache), "component", "storage")
+	slog.Info(fmt.Sprintf("state=%s", layout.StateDir), "component", "storage")
+	slog.Info(
+		fmt.Sprintf(
+			"data=%s (fstype=%s mount=%t)",
+			layout.DataDir,
+			mountInfo(layout.DataDir),
+			mounted,
+		),
+		"component",
+		"storage",
+	)
 }

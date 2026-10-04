@@ -179,6 +179,38 @@ func TestCollectReportsFailedTasks(t *testing.T) {
 	}
 }
 
+// TestCollectOmitsBlockedDependentsFromFailed keeps the page's failed list
+// focused on root causes. Cascaded BLOCKED tasks stay in Tasks with their
+// dependency message, but must not crowd the lead-in list.
+func TestCollectOmitsBlockedDependentsFromFailed(t *testing.T) {
+	options := testOptions()
+	options.Results = map[string]setup.TaskResult{
+		setup.TaskGPU: {
+			State: setup.Failed,
+			Error: testError("reboot required: nvidia driver is not loaded yet"),
+		},
+		setup.TaskDockerGPU: {
+			State: setup.Blocked,
+			Error: testError(`dependency "gpu" for task "docker-gpu" did not complete`),
+		},
+		setup.TaskVLLM: {
+			State: setup.Blocked,
+			Error: testError(`dependency "docker-gpu" for task "vllm" did not complete`),
+		},
+	}
+
+	document := NewCollector().Collect(context.Background(), options)
+
+	if got := document.Setup.Failed; len(got) != 1 || got[0] != setup.TaskGPU {
+		t.Fatalf("failed = %v, want only [%s]", got, setup.TaskGPU)
+	}
+
+	if document.Setup.Tasks[setup.TaskDockerGPU].State != string(setup.Blocked) {
+		t.Errorf("docker-gpu state = %q, want BLOCKED on the task map",
+			document.Setup.Tasks[setup.TaskDockerGPU].State)
+	}
+}
+
 // TestCollectReportsHostMetrics checks the monitoring block is populated from
 // the running machine. A status page showing zeroes is indistinguishable from a
 // broken one, so the collectors have to actually read something.

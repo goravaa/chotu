@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -67,7 +67,7 @@ func (p *Publisher) Publish(ctx context.Context, document status.Status) {
 
 	body, err := json.Marshal(document)
 	if err != nil {
-		log.Printf("[status] could not encode the status document: %v", err)
+		slog.Error("could not encode the status document", "component", "status", "error", err)
 		return
 	}
 
@@ -78,7 +78,7 @@ func (p *Publisher) Publish(ctx context.Context, document status.Status) {
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		log.Printf("[status] could not build the request: %v", err)
+		slog.Error("could not build the request", "component", "status", "error", err)
 		return
 	}
 
@@ -86,7 +86,7 @@ func (p *Publisher) Publish(ctx context.Context, document status.Status) {
 
 	response, err := p.client.Do(request)
 	if err != nil {
-		log.Printf("[status] could not reach the status service on port %d: %v", p.port, err)
+		slog.Error("could not reach the status service", "component", "status", "port", p.port, "error", err)
 		return
 	}
 
@@ -97,9 +97,6 @@ func (p *Publisher) Publish(ctx context.Context, document status.Status) {
 	_, _ = io.Copy(io.Discard, response.Body)
 
 	if response.StatusCode != http.StatusNoContent {
-		log.Printf(
-			"[status] the status service rejected the document: %s",
-			response.Status,
-		)
+		slog.Error("the status service rejected the document", "component", "status", "status_code", response.Status)
 	}
 }

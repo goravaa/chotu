@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -97,8 +98,8 @@ func TestRunnerDependencyFailure(t *testing.T) {
 		t.Fatalf("A = %s", results["A"].State)
 	}
 
-	if results["B"].State != Failed {
-		t.Fatalf("B = %s", results["B"].State)
+	if results["B"].State != Blocked {
+		t.Fatalf("B = %s, want BLOCKED", results["B"].State)
 	}
 }
 
@@ -270,8 +271,8 @@ func TestRunnerPanicDoesNotKillProcessOrHang(t *testing.T) {
 		t.Fatalf("panics error = %v", results["panics"].Error)
 	}
 
-	if results["dependent"].State != Failed {
-		t.Fatalf("dependent = %s", results["dependent"].State)
+	if results["dependent"].State != Blocked {
+		t.Fatalf("dependent = %s, want BLOCKED", results["dependent"].State)
 	}
 
 	if atomic.LoadInt32(&dependentRan) != 0 {
@@ -341,8 +342,8 @@ func TestRunnerNilRunIsReportedAsFailure(t *testing.T) {
 		t.Fatalf("has-no-body = %s, want FAILED", results["has-no-body"].State)
 	}
 
-	if results["after"].State != Failed {
-		t.Fatalf("after = %s, want FAILED", results["after"].State)
+	if results["after"].State != Blocked {
+		t.Fatalf("after = %s, want BLOCKED", results["after"].State)
 	}
 }
 
@@ -419,9 +420,9 @@ func TestRunnerSurvivesStoreFailure(t *testing.T) {
 		t.Errorf("task ran %d times, want 1", ran)
 	}
 
-	// Running then final state per task.
-	if got := atomic.LoadInt32(&store.calls); got != 4 {
-		t.Errorf("store calls = %d, want 4", got)
+	// PENDING seed, then RUNNING, then terminal state per task.
+	if got := atomic.LoadInt32(&store.calls); got != 6 {
+		t.Errorf("store calls = %d, want 6", got)
 	}
 }
 
@@ -559,12 +560,85 @@ func TestRunnerPersistsFailureAndSkippedDependency(t *testing.T) {
 	}
 
 	wantDep := `dependency "boom" for task "dependent" did not complete`
-	if got["dependent"][0] != "FAILED" || got["dependent"][1] != wantDep {
-		t.Errorf("dependent = %v, want %v", got["dependent"], wantDep)
+	if got["dependent"][0] != "BLOCKED" || got["dependent"][1] != wantDep {
+		t.Errorf("dependent = %v, want BLOCKED / %v", got["dependent"], wantDep)
 	}
 
 	if got["independent"][0] != "COMPLETED" {
 		t.Errorf("independent = %v", got["independent"])
+	}
+}
+
+func TestRunnerReportsProgressOnStateChanges(t *testing.T) {
+	var mu sync.Mutex
+	var snapshots []map[string]TaskResult
+
+	started := make(chan struct{})
+
+	tasks := []*Task{
+		{
+			Name: "slow",
+			Run: func(context.Context) error {
+				close(started)
+				time.Sleep(50 * time.Millisecond)
+				return nil
+			},
+		},
+		{
+			Name:         "after",
+			Dependencies: []string{"slow"},
+			Run:          func(context.Context) error { return nil },
+		},
+	}
+
+	NewRunner(tasks, nil).
+		WithRetryPolicy(1, time.Millisecond).
+		WithProgress(func(results map[string]TaskResult) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			copy := make(map[string]TaskResult, len(results))
+			for name, result := range results {
+				copy[name] = result
+			}
+
+			snapshots = append(snapshots, copy)
+		}).
+		Run(context.Background())
+
+	<-started
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(snapshots) < 3 {
+		t.Fatalf("progress calls = %d, want at least PENDING+RUNNING+COMPLETED", len(snapshots))
+	}
+
+	first := snapshots[0]
+	if first["slow"].State != Pending || first["after"].State != Pending {
+		t.Fatalf("first snapshot = %v, want both PENDING", first)
+	}
+
+	sawRunning := false
+	sawDone := false
+
+	for _, snap := range snapshots {
+		if snap["slow"].State == Running {
+			sawRunning = true
+		}
+
+		if snap["slow"].State == Completed && snap["after"].State == Completed {
+			sawDone = true
+		}
+	}
+
+	if !sawRunning {
+		t.Error("progress never reported RUNNING")
+	}
+
+	if !sawDone {
+		t.Error("progress never reported both tasks COMPLETED")
 	}
 }
 

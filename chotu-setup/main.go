@@ -5,12 +5,13 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,8 +22,7 @@ import (
 )
 
 const (
-	defaultStateDBPath = "/var/lib/chotu/chotu.db"
-	defaultInterval    = 60 * time.Second
+	defaultInterval = 60 * time.Second
 )
 
 // version is stamped in at build time by the makefile. The daemon runs for the
@@ -42,8 +42,8 @@ func run() int {
 	)
 	dbPath := flag.String(
 		"db",
-		envString("CHOTU_STATE_DB", defaultStateDBPath),
-		"path to the Chotu state database",
+		"",
+		"path to the Chotu state database (default: <layout.StateDir>/chotu.db)",
 	)
 	interval := flag.Duration(
 		"interval",
@@ -66,15 +66,38 @@ func run() int {
 		"delay before the first task retry, doubled on each subsequent retry",
 	)
 
+	logLevelFlag := flag.String(
+		"log-level",
+		envString("CHOTU_LOG_LEVEL", "info"),
+		"logging level (debug, info, warn, error)",
+	)
+
 	flag.Parse()
 
+	var logLevel slog.Level
+	switch *logLevelFlag {
+	case "debug":
+		logLevel = slog.LevelDebug
+	case "warn", "warning":
+		logLevel = slog.LevelWarn
+	case "error":
+		logLevel = slog.LevelError
+	default:
+		logLevel = slog.LevelInfo
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	}))
+	slog.SetDefault(logger)
+
 	if *interval <= 0 {
-		log.Printf("invalid -interval %s: must be positive", *interval)
+		slog.Error("invalid -interval: must be positive", "interval", *interval)
 		return 2
 	}
 
 	if *attempts < 1 {
-		log.Printf("invalid -attempts %d: must be at least 1", *attempts)
+		slog.Error("invalid -attempts: must be at least 1", "attempts", *attempts)
 		return 2
 	}
 
@@ -85,33 +108,57 @@ func run() int {
 	)
 	defer stop()
 
-	// The storage task creates the directory the database lives in, so keep the
-	// two in step when -db points somewhere other than the default.
-	if os.Getenv("CHOTU_STATE_DIR") == "" {
-		if err := os.Setenv("CHOTU_STATE_DIR", filepath.Dir(*dbPath)); err != nil {
-			log.Printf("set CHOTU_STATE_DIR: %v", err)
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		slog.Error("failed to load config", "error", err)
+		return 1
+	}
+
+	// Resolve the DB path from the storage layout unless the operator overrode
+	// it. The old hard-coded default (/var/lib/chotu/chotu.db) also set
+	// CHOTU_STATE_DIR, which forced every machine onto the root-disk state path
+	// and broke ephemeral mode (workspace/docker on /data, state on root).
+	explicitDB := *dbPath != "" || os.Getenv("CHOTU_STATE_DB") != ""
+	resolvedDB := *dbPath
+	if resolvedDB == "" {
+		resolvedDB = os.Getenv("CHOTU_STATE_DB")
+	}
+
+	if explicitDB && os.Getenv("CHOTU_STATE_DIR") == "" {
+		if err := os.Setenv("CHOTU_STATE_DIR", filepath.Dir(resolvedDB)); err != nil {
+			slog.Error("failed to set CHOTU_STATE_DIR", "error", err)
 		}
 	}
 
-	db, err := state.Open(*dbPath)
+	layout := setup.ResolveLayout(cfg)
+	if !explicitDB {
+		resolvedDB = filepath.Join(layout.StateDir, "chotu.db")
+	}
+
+	db, err := state.Open(resolvedDB)
 	if err != nil {
-		log.Printf("open state database: %v", err)
+		slog.Error("failed to open state database", "error", err)
 		return 1
 	}
 	defer db.Close() //nolint:errcheck // main cannot report it; the process is exiting
 
-	log.Printf(
-		"chotu-setup %s starting: config=%s db=%s interval=%s once=%t attempts=%d retry-delay=%s",
-		version,
-		*configPath,
-		*dbPath,
-		*interval,
-		*once,
-		*attempts,
-		*retryDelay,
+	slog.Info(
+		"chotu-setup starting",
+		"version", version,
+		"config", *configPath,
+		"db", resolvedDB,
+		"state_dir", layout.StateDir,
+		"storage_mode", layout.Mode,
+		"interval", *interval,
+		"once", *once,
+		"attempts", *attempts,
+		"retry-delay", *retryDelay,
 	)
 
 	if *once {
+		collector := publish.NewCollector()
+		cycles := 1
+
 		report, err := runCycle(
 			ctx,
 			db,
@@ -119,13 +166,14 @@ func run() int {
 			setup.Tasks,
 			*attempts,
 			*retryDelay,
+			liveProgress(ctx, collector, cycles),
 		)
 		if err != nil {
-			log.Printf("setup cycle failed: %v", err)
+			slog.Error("setup cycle failed", "error", err)
 			return 1
 		}
 
-		publishStatus(ctx, publish.NewCollector(), report, 1)
+		publishStatus(ctx, collector, report, cycles)
 
 		if failed := report.failed(); len(failed) > 0 {
 			return 1
@@ -160,7 +208,7 @@ func runDaemon(
 
 	for {
 		if ctx.Err() != nil {
-			log.Printf("shutdown requested; stopping after %d cycles", cycles)
+			slog.Info("shutdown requested", "cycles", cycles)
 			return 0
 		}
 
@@ -168,7 +216,7 @@ func runDaemon(
 
 		started := time.Now()
 
-		log.Printf("setup cycle %d starting", cycles)
+		slog.Info("setup cycle starting", "cycle", cycles)
 
 		cycle, err := runCycle(
 			ctx,
@@ -177,28 +225,28 @@ func runDaemon(
 			tasksFor,
 			attempts,
 			retryDelay,
+			liveProgress(ctx, collector, cycles),
 		)
 		if err != nil {
-			log.Printf("setup cycle %d error: %v", cycles, err)
+			slog.Error("setup cycle error", "cycle", cycles, "error", err)
 		}
 
-		// Publish after every cycle, including a failed one. The user watching
-		// the page during a slow first boot is exactly who needs to see which
-		// task is stuck, so a cycle that reports nothing is the one case where
-		// staying quiet is wrong.
+		// Publish after every cycle, including a failed one. Mid-cycle
+		// publishes already keep the page live; this final document pins the
+		// terminal machine state (READY/FAILED) and the full cycle duration.
 		if cycle != nil {
 			publishStatus(ctx, collector, cycle, cycles)
 		}
 
-		log.Printf(
-			"setup cycle %d finished in %s",
-			cycles,
-			time.Since(started).Round(time.Millisecond),
+		slog.Info(
+			"setup cycle finished",
+			"cycle", cycles,
+			"duration", time.Since(started).Round(time.Millisecond),
 		)
 
 		select {
 		case <-ctx.Done():
-			log.Printf("shutdown requested; stopping after %d cycles", cycles)
+			slog.Info("shutdown requested", "cycles", cycles)
 			return 0
 		case <-time.After(interval):
 		}
@@ -230,14 +278,50 @@ func (r *cycleReport) failed() []string {
 	return failed
 }
 
-// publishStatus sends the cycle's outcome to the status service. The publisher
-// is built per cycle from the config that cycle used, so a port change in
+// liveProgress returns a hook that publishes INITIALIZING documents as the
+// task graph advances. Without this the status page stays on the previous
+// cycle (or empty) for the whole first boot while gpu/vllm run for minutes.
+//
+// Publishes are serialised: the runner fires progress from many goroutines,
+// and a single in-flight Collect+POST is enough to keep the page honest.
+func liveProgress(
+	ctx context.Context,
+	collector *publish.Collector,
+	cycles int,
+) func(*config.Config, setup.Layout, map[string]setup.TaskResult, time.Duration) {
+	var mu sync.Mutex
+
+	return func(
+		cfg *config.Config,
+		layout setup.Layout,
+		results map[string]setup.TaskResult,
+		elapsed time.Duration,
+	) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		publishStatus(ctx, collector, &cycleReport{
+			Config:       cfg,
+			Layout:       layout,
+			Results:      results,
+			MachineState: string(state.StateInitializing),
+			Duration:     elapsed,
+		}, cycles)
+	}
+}
+
+// publishStatus sends a status document to the status service. The publisher
+// is built per call from the config that cycle used, so a port change in
 // config.yaml takes effect without a restart.
 //
 // The collector is shared across cycles on purpose. It remembers the previous
 // CPU reading, because utilisation is only a delta; a fresh collector per cycle
 // would report zero forever and make the page useless.
 func publishStatus(ctx context.Context, collector *publish.Collector, report *cycleReport, cycles int) {
+	if collector == nil || report == nil || report.Config == nil {
+		return
+	}
+
 	publisher := publish.NewPublisher(
 		"",
 		report.Config.StatusPage.Port,
@@ -257,6 +341,14 @@ func publishStatus(ctx context.Context, collector *publish.Collector, report *cy
 	publisher.Publish(ctx, document)
 }
 
+// cycleProgress is called as the task graph advances during a cycle.
+type cycleProgress func(
+	cfg *config.Config,
+	layout setup.Layout,
+	results map[string]setup.TaskResult,
+	elapsed time.Duration,
+)
+
 func runCycle(
 	ctx context.Context,
 	db *sql.DB,
@@ -264,6 +356,7 @@ func runCycle(
 	tasksFor func(*config.Config) []*setup.Task,
 	attempts int,
 	retryDelay time.Duration,
+	onProgress cycleProgress,
 ) (*cycleReport, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -290,11 +383,7 @@ func runCycle(
 			return nil, err
 		}
 	} else if machine.ConfigHash != configHash {
-		log.Printf(
-			"config changed: %s -> %s, re-running setup",
-			machine.ConfigHash,
-			configHash,
-		)
+		slog.Info("config changed, re-running setup", "old_hash", machine.ConfigHash, "new_hash", configHash)
 	}
 
 	if err := state.UpdateMachineState(
@@ -309,6 +398,12 @@ func runCycle(
 
 	runner := setup.NewRunner(tasks, state.NewStore(db)).
 		WithRetryPolicy(attempts, retryDelay)
+
+	if onProgress != nil {
+		runner = runner.WithProgress(func(results map[string]setup.TaskResult) {
+			onProgress(cfg, layout, results, time.Since(started))
+		})
+	}
 
 	results := runner.Run(ctx)
 
@@ -344,13 +439,17 @@ func runCycle(
 	report.Duration = time.Since(started)
 
 	for _, name := range failed {
-		log.Printf("task %s failed: %v", name, results[name].Error)
+		if results[name].State != setup.Failed {
+			continue
+		}
+
+		slog.Error("task failed", "task", name, "error", results[name].Error)
 	}
 
-	log.Printf(
-		"setup finished: %d tasks, machine state %s",
-		len(results),
-		finalState,
+	slog.Info(
+		"setup finished",
+		"tasks_count", len(results),
+		"state", finalState,
 	)
 
 	return report, nil
@@ -382,13 +481,7 @@ func envInt(name string, fallback int) int {
 
 	parsed, err := strconv.Atoi(raw)
 	if err != nil {
-		log.Printf(
-			"%s=%q is not a valid integer (%v), using %d",
-			name,
-			raw,
-			err,
-			fallback,
-		)
+		slog.Warn("invalid integer environment variable, using fallback", "name", name, "raw", raw, "error", err, "fallback", fallback)
 
 		return fallback
 	}
@@ -404,13 +497,7 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 
 	parsed, err := time.ParseDuration(raw)
 	if err != nil {
-		log.Printf(
-			"%s=%q is not a valid duration (%v), using %s",
-			name,
-			raw,
-			err,
-			fallback,
-		)
+		slog.Warn("invalid duration environment variable, using fallback", "name", name, "raw", raw, "error", err, "fallback", fallback)
 
 		return fallback
 	}

@@ -9,6 +9,10 @@ const (
 	Running   TaskState = "RUNNING"
 	Completed TaskState = "COMPLETED"
 	Failed    TaskState = "FAILED"
+	// Blocked means the task never ran because a dependency did not complete.
+	// It is distinct from Failed so the status page can lead with the root
+	// cause rather than a cascade of dependency messages.
+	Blocked TaskState = "BLOCKED"
 )
 
 type Task struct {

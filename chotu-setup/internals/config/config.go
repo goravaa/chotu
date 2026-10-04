@@ -81,13 +81,11 @@ type ToolingConfig struct {
 }
 
 // StatusPageConfig describes the progress page the user opens in a browser to
-// see what the machine is doing. It runs as a container pulled from a registry,
-// not as a process the setup daemon manages, so only the image and the port are
-// configuration.
+// see what the machine is doing. Bootstrap installs it as a host binary under
+// systemd; the setup daemon only health-checks and restarts that unit.
 type StatusPageConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	Image   string `yaml:"image"`
-	Port    int    `yaml:"port"`
+	Enabled bool `yaml:"enabled"`
+	Port    int  `yaml:"port"`
 }
 
 func Load(path string) (*Config, error) {
@@ -128,10 +126,6 @@ func (c Config) Validate() error {
 
 	if c.S3.Enabled && c.S3.Bucket == "" {
 		return fmt.Errorf("s3.enabled is true but s3.bucket_name is empty")
-	}
-
-	if c.StatusPage.Enabled && c.StatusPage.Image == "" {
-		return fmt.Errorf("status_page.enabled is true but status_page.image is empty")
 	}
 
 	return nil
