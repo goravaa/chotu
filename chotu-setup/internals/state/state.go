@@ -11,15 +11,17 @@ import (
 type MachineState string
 
 const (
-	StateFresh        MachineState = "FRESH"
-	StateInitializing MachineState = "INITIALIZING"
-	StateReady        MachineState = "READY"
-	StateFailed       MachineState = "FAILED"
+	StateFresh          MachineState = "FRESH"
+	StateInitializing   MachineState = "INITIALIZING"
+	StateReady          MachineState = "READY"
+	StateFailed         MachineState = "FAILED"
+	StateRebootRequired MachineState = "REBOOT_REQUIRED"
 )
 
 const (
-	taskStateRunning   = "RUNNING"
-	taskStateCompleted = "COMPLETED"
+	taskStateRunning        = "RUNNING"
+	taskStateCompleted      = "COMPLETED"
+	taskStateRebootRequired = "REBOOT_REQUIRED"
 )
 
 type Machine struct {

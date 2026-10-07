@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -175,6 +176,13 @@ func run() int {
 
 		publishStatus(ctx, collector, report, cycles)
 
+		if report != nil && report.MachineState == string(state.StateRebootRequired) {
+			slog.Info("reboot required, initiating system reboot")
+			if err := exec.CommandContext(ctx, "systemctl", "reboot").Run(); err != nil {
+				slog.Error("failed to initiate reboot", "error", err)
+			}
+		}
+
 		if failed := report.failed(); len(failed) > 0 {
 			return 1
 		}
@@ -236,6 +244,14 @@ func runDaemon(
 		// terminal machine state (READY/FAILED) and the full cycle duration.
 		if cycle != nil {
 			publishStatus(ctx, collector, cycle, cycles)
+
+			if cycle.MachineState == string(state.StateRebootRequired) {
+				slog.Info("reboot required, initiating system reboot")
+				if err := exec.CommandContext(ctx, "systemctl", "reboot").Run(); err != nil {
+					slog.Error("failed to initiate reboot", "error", err)
+				}
+				// We don't exit immediately; wait for shutdown context.
+			}
 		}
 
 		slog.Info(
@@ -268,7 +284,7 @@ func (r *cycleReport) failed() []string {
 	failed := make([]string, 0)
 
 	for name, result := range r.Results {
-		if result.State != setup.Completed {
+		if result.State != setup.Completed && result.State != setup.RebootRequired {
 			failed = append(failed, name)
 		}
 	}
@@ -276,6 +292,15 @@ func (r *cycleReport) failed() []string {
 	sort.Strings(failed)
 
 	return failed
+}
+
+func (r *cycleReport) rebootRequired() bool {
+	for _, result := range r.Results {
+		if result.State == setup.RebootRequired {
+			return true
+		}
+	}
+	return false
 }
 
 // liveProgress returns a hook that publishes INITIALIZING documents as the
@@ -421,9 +446,12 @@ func runCycle(
 	}
 
 	failed := report.failed()
+	rebootRequired := report.rebootRequired()
 
 	finalState := state.StateReady
-	if len(failed) > 0 {
+	if rebootRequired {
+		finalState = state.StateRebootRequired
+	} else if len(failed) > 0 {
 		finalState = state.StateFailed
 	}
 

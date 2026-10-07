@@ -2,6 +2,7 @@ package setup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -174,7 +175,13 @@ func (r *Runner) runTask(
 	err := r.runWithRetries(ctx, task)
 
 	if err != nil {
-		record(Failed, err)
+		var rebootErr ErrRebootRequired
+		if errors.As(err, &rebootErr) {
+			slog.Info("task requires reboot", "task", task.Name, "state", "reboot_required")
+			record(RebootRequired, err)
+		} else {
+			record(Failed, err)
+		}
 
 		return
 	}

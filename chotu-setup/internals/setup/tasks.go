@@ -29,6 +29,14 @@ const (
 	TaskSync      = "sync"
 )
 
+type ErrRebootRequired struct {
+	Message string
+}
+
+func (e ErrRebootRequired) Error() string {
+	return e.Message
+}
+
 const (
 	commandTimeout = 60 * time.Second
 
@@ -658,7 +666,7 @@ func installNvidiaStack(ctx context.Context, layout Layout) error {
 		slog.Info(fmt.Sprintf("[gpu] %s installed. The GPU will not be usable until the machine reboots; "+
 			"reboot it and the next cycle will finish the setup", driver))
 
-		return fmt.Errorf("reboot required: %s was just installed and the driver is not loaded yet", driver)
+		return ErrRebootRequired{Message: fmt.Sprintf("reboot required: %s was just installed and the driver is not loaded yet", driver)}
 	}
 
 	const (
@@ -811,8 +819,16 @@ func setupRclone(_ *config.Config, layout Layout) func(context.Context) error {
 
 		remote := "[s3]\ntype = s3\nprovider = AWS\nenv_auth = true\n"
 
-		if _, err := writeFileIfChanged(filepath.Join(rcloneDir, "rclone.conf"), remote, 0o600); err != nil {
+		configPath := filepath.Join(rcloneDir, "rclone.conf")
+		if _, err := writeFileIfChanged(configPath, remote, 0o600); err != nil {
 			return err
+		}
+
+		// Ensure the actual RunUser can read the file since writeFileIfChanged writes it as root
+		if layout.RunUser != "" && layout.RunUser != "root" && isRoot() {
+			if err := chownRecursive(configPath, layout.RunUser); err != nil {
+				return fmt.Errorf("set rclone.conf ownership: %w", err)
+			}
 		}
 
 		version, err := run(ctx, "rclone", "version")
@@ -958,23 +974,25 @@ func setupOpenCode(cfg *config.Config, layout Layout) func(context.Context) erro
 			return nil
 		}
 
-		if !commandExists("opencode") {
+		openCodePath := filepath.Join(layout.Home, ".opencode", "bin", "opencode")
+
+		if _, err := os.Stat(openCodePath); err != nil {
 			if err := installOpenCode(ctx, layout); err != nil {
 				return err
 			}
 		}
 
-		if !commandExists("opencode") {
-			return fmt.Errorf("opencode is not installed after trying to install it")
+		if _, err := os.Stat(openCodePath); err != nil {
+			return fmt.Errorf("opencode executable not found at %s after trying to install it", openCodePath)
 		}
 
 		if err := writeOpenCodeConfig(cfg, layout); err != nil {
 			return err
 		}
 
-		version, err := run(ctx, "opencode", "--version")
+		version, err := asRunUser(ctx, layout, openCodePath, "--version")
 		if err != nil {
-			return fmt.Errorf("opencode --version: %w", err)
+			return fmt.Errorf("verify opencode execution at %s: %w", openCodePath, err)
 		}
 
 		slog.Info(fmt.Sprintf("%s configured in %s", strings.TrimSpace(version), layout.Workspace), "component", "opencode")
@@ -1318,50 +1336,31 @@ func setupStatusPage(cfg *config.Config, _ Layout) func(context.Context) error {
 			"port", port,
 		)
 
-		// Check whether the service is currently running.
+		// First, try ensuring the service is cleanly running.
 		if _, err := run(ctx, "systemctl", "is-active", "--quiet", service); err == nil {
-			slog.Debug(
-				"status service is running",
-				"component", "status",
-				"service", service,
-			)
-
-			// Service is running, so verify that the HTTP endpoint is
-			// actually responding.
 			if statusPageResponds(ctx, port) {
-				slog.Info(
-					"status page ready",
-					"component", "status",
-					"service", service,
-					"port", port,
-				)
+				slog.Info("status page ready", "component", "status", "service", service, "port", port)
 				return nil
 			}
 
-			slog.Warn(
-				"status service is running but status page is not responding; restarting service",
-				"component", "status",
-				"service", service,
-				"port", port,
-			)
+			slog.Warn("status service is running but status page is not responding; restarting service",
+				"component", "status", "service", service, "port", port)
 		} else {
-			slog.Warn(
-				"status service is not running; restarting service",
-				"component", "status",
-				"service", service,
-			)
+			slog.Warn("status service is not running; restarting service",
+				"component", "status", "service", service)
 		}
 
-		// Service was either not running or was unhealthy.
-		if out, err := execOutputCtx(ctx, "systemctl", "restart", service); err != nil {
-			slog.Error(
-				"failed to restart status service",
-				"component", "status",
-				"service", service,
-				"error", err,
-				"output", strings.TrimSpace(out),
-			)
+		// The service wasn't running or wasn't responding. We'll try to restart it.
+		// However, before we restart, we want to clear out any old/stale process occupying
+		// the port, avoiding "bind: address already in use".
+		if isRoot() && commandExists("fuser") {
+			// Ignore errors from fuser, as it might just mean no process was listening
+			_, _ = execOutputCtx(ctx, "fuser", "-k", "-9", fmt.Sprintf("%d/tcp", port))
+		}
 
+		if out, err := execOutputCtx(ctx, "systemctl", "restart", service); err != nil {
+			// If restart failed, maybe the service is not enabled/installed.
+			slog.Error("failed to restart status service", "component", "status", "service", service, "error", err, "output", strings.TrimSpace(out))
 			return fmt.Errorf("restart status service: %w", err)
 		}
 
