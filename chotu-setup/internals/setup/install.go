@@ -143,25 +143,23 @@ func aptInstall(ctx context.Context, pkgs ...string) error {
 	})
 }
 
-// aptRepo adds an apt source with its signing key, unless the source is already
-// present. Returns true when the source was added.
+// aptRepo reconciles an APT source and its signing key, repairing existing
+// managed files when their contents need updating. Returns true when the
+// repository source file was changed.
 //
-// keyring must carry the extension matching how the key is published: .asc for
-// an ASCII-armoured key (Docker) and .gpg for a binary one (NVIDIA). apt
-// infers the format from the extension, so writing the fetched bytes verbatim is
-// correct for both.
+// keyring uses .asc or .gpg according to the format expected by APT.
+// ASCII-armored keys must be dearmored before writing to a .gpg keyring;
+// binary keyrings can be written directly. Repository entries are updated
+// with signed-by so APT verifies the source using the specified keyring.
+
 func aptRepo(ctx context.Context, name, keyURL, keyring, listURL string) (bool, error) {
 	listPath := filepath.Join("/etc/apt/sources.list.d", name+".list")
-
-	if _, err := os.Stat(listPath); err == nil {
-		return false, nil
-	}
 
 	if !isRoot() {
 		return false, fmt.Errorf("adding the %s apt repository needs root", name)
 	}
 
-	slog.Info(fmt.Sprintf("adding the %s repository", name), "component", "apt")
+	slog.Info(fmt.Sprintf("configuring the %s repository", name), "component", "apt")
 
 	added := false
 
@@ -169,26 +167,99 @@ func aptRepo(ctx context.Context, name, keyURL, keyring, listURL string) (bool, 
 		runCtx, cancel := context.WithTimeout(ctx, aptTimeout)
 		defer cancel()
 
+		// Fetch the ASCII-armored public signing key.
 		key, err := execOutputCtx(runCtx, "curl", "-fsSL", keyURL)
 		if err != nil {
 			return fmt.Errorf("fetch %s signing key: %w", name, err)
 		}
-
-		if _, err := writeFileIfChanged(keyring, key, 0o644); err != nil {
-			return err
+		if strings.TrimSpace(key) == "" {
+			return fmt.Errorf("fetch %s signing key: empty response", name)
 		}
 
+		// Write the downloaded key to a temporary file.
+		keyInput, err := os.CreateTemp("", name+"-key-*.asc")
+		if err != nil {
+			return fmt.Errorf("create temporary signing key: %w", err)
+		}
+		keyInputPath := keyInput.Name()
+		defer os.Remove(keyInputPath)
+
+		if _, err := keyInput.WriteString(key); err != nil {
+			keyInput.Close()
+			return fmt.Errorf("write temporary signing key: %w", err)
+		}
+		if err := keyInput.Close(); err != nil {
+			return fmt.Errorf("close temporary signing key: %w", err)
+		}
+
+		// Convert the ASCII-armored key into a binary OpenPGP keyring.
+		keyOutput, err := os.CreateTemp("", name+"-key-*.gpg")
+		if err != nil {
+			return fmt.Errorf("create temporary keyring: %w", err)
+		}
+		keyOutputPath := keyOutput.Name()
+		if err := keyOutput.Close(); err != nil {
+			os.Remove(keyOutputPath)
+			return fmt.Errorf("close temporary keyring: %w", err)
+		}
+		defer os.Remove(keyOutputPath)
+
+		if _, err := execOutputCtx(
+			runCtx,
+			"gpg", "--batch", "--yes", "--dearmor",
+			"--output", keyOutputPath,
+			keyInputPath,
+		); err != nil {
+			return fmt.Errorf("dearmor %s signing key: %w", name, err)
+		}
+
+		binaryKey, err := os.ReadFile(keyOutputPath)
+		if err != nil {
+			return fmt.Errorf("read dearmored %s keyring: %w", name, err)
+		}
+		if len(binaryKey) == 0 {
+			return fmt.Errorf("dearmored %s keyring is empty", name)
+		}
+
+		// Install the binary keyring only after conversion succeeds.
+		if _, err := writeFileIfChanged(keyring, string(binaryKey), 0o644); err != nil {
+			return fmt.Errorf("install %s keyring: %w", name, err)
+		}
+
+		// Fetch the upstream repository definition.
 		list, err := execOutputCtx(runCtx, "curl", "-fsSL", listURL)
 		if err != nil {
 			return fmt.Errorf("fetch %s source list: %w", name, err)
 		}
-
-		if _, err := writeFileIfChanged(listPath, withSignedBy(list, keyring), 0o644); err != nil {
-			return err
+		if strings.TrimSpace(list) == "" {
+			return fmt.Errorf("fetch %s source list: empty response", name)
 		}
 
-		added = true
+		// Add the signing-key restriction to the repository entries.
+		source := withSignedBy(list, keyring)
 
+		// Validate basic content before writing the managed source file.
+		if strings.TrimSpace(source) == "" {
+			return fmt.Errorf("%s source list is empty after processing", name)
+		}
+		hasEntry := false
+		for _, line := range strings.Split(source, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "deb ") || strings.HasPrefix(line, "deb-src ") {
+				hasEntry = true
+				break
+			}
+		}
+		if !hasEntry {
+			return fmt.Errorf("%s source list contains no supported deb entries", name)
+		}
+
+		changed, err := writeFileIfChanged(listPath, source, 0o644)
+		if err != nil {
+			return fmt.Errorf("write %s source list: %w", name, err)
+		}
+
+		added = changed
 		return nil
 	})
 
@@ -206,12 +277,20 @@ func withSignedBy(list, keyring string) string {
 		switch {
 		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
 			out = append(out, trimmed)
-		case strings.Contains(trimmed, "signed-by="):
-			out = append(out, trimmed)
+
 		case strings.HasPrefix(trimmed, "deb ["):
-			out = append(out, insertOption(trimmed, "signed-by="+keyring))
+			if strings.Contains(trimmed, "signed-by=") {
+				out = append(out, trimmed)
+			} else {
+				out = append(out, insertOption(trimmed, "signed-by="+keyring))
+			}
+
+		case strings.HasPrefix(trimmed, "deb "):
+			rest := strings.TrimPrefix(trimmed, "deb ")
+			out = append(out, "deb [signed-by="+keyring+"] "+rest)
+
 		default:
-			out = append(out, trimmed+" signed-by="+keyring)
+			out = append(out, trimmed)
 		}
 	}
 
