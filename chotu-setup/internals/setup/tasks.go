@@ -276,21 +276,21 @@ func osReleaseValue(contents, key string) string {
 func setupStorage(cfg *config.Config, layout Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		logLayout(layout)
-        
-		if err := os.MkdirAll(layout.DataDir, 0755); err != nil {
-            return fmt.Errorf("create data directory %s: %w", layout.DataDir, err)
-        }
-		
-		mounted, mountErr := isMountpoint(layout.DataDir)
-        if mountErr != nil {
-            return fmt.Errorf("check mountpoint %s: %w", layout.DataDir, mountErr)
-        }
 
-        if !mounted {
-            if err := mountInstanceStore(layout.DataDir); err != nil {
-                return fmt.Errorf("mount instance store: %w", err)
-        }
-    }
+		if err := os.MkdirAll(layout.DataDir, 0755); err != nil {
+			return fmt.Errorf("create data directory %s: %w", layout.DataDir, err)
+		}
+
+		mounted, mountErr := isMountpoint(layout.DataDir)
+		if mountErr != nil {
+			return fmt.Errorf("check mountpoint %s: %w", layout.DataDir, mountErr)
+		}
+
+		if !mounted {
+			if err := mountInstanceStore(layout.DataDir); err != nil {
+				return fmt.Errorf("mount instance store: %w", err)
+			}
+		}
 
 		for _, dir := range []string{
 			layout.StateDir,
@@ -782,7 +782,7 @@ func setupDockerGPU(_ *config.Config, _ Layout) func(context.Context) error {
 		defer cancel()
 
 		if out, err := execOutputCtx(runCtx, "docker", "run", "--rm",
-			"--runtime=nvidia", "--gpus", "all", "ubuntu", "nvidia-smi"); err != nil {
+			"--device", "nvidia.com/gpu=all", "ubuntu", "nvidia-smi"); err != nil {
 			return fmt.Errorf(
 				"docker can run containers but not on the GPU: %w: %s",
 				err,
@@ -1200,7 +1200,7 @@ func reconcileVLLMContainer(
 		"run", "-d",
 		"--name", dockerContainerName,
 		"--restart", "unless-stopped",
-		"--gpus", "all",
+		"--device", "nvidia.com/gpu=all",
 		"--ipc=host",
 		"--label", "chotu.fingerprint=" + fingerprint,
 		"-p", fmt.Sprintf("%d:8000", port),
