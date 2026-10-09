@@ -276,21 +276,21 @@ func osReleaseValue(contents, key string) string {
 func setupStorage(cfg *config.Config, layout Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		logLayout(layout)
-
+        
+		if err := os.MkdirAll(layout.DataDir, 0755); err != nil {
+            return fmt.Errorf("create data directory %s: %w", layout.DataDir, err)
+        }
+		
 		mounted, mountErr := isMountpoint(layout.DataDir)
-		if mountErr != nil {
-			return fmt.Errorf(
-				"the instance store is not mounted at %s: %w",
-				layout.DataDir,
-				mountErr,
-			)
-		}
-		if !mounted {
-			return fmt.Errorf(
-				"%s is not a mount point: the EC2 instance store must be attached and formatted",
-				layout.DataDir,
-			)
-		}
+        if mountErr != nil {
+            return fmt.Errorf("check mountpoint %s: %w", layout.DataDir, mountErr)
+        }
+
+        if !mounted {
+            if err := mountInstanceStore(layout.DataDir); err != nil {
+                return fmt.Errorf("mount instance store: %w", err)
+        }
+    }
 
 		for _, dir := range []string{
 			layout.StateDir,
@@ -1315,7 +1315,6 @@ func containerLogs(ctx context.Context, container string, lines int) string {
 	return out
 }
 
-
 func setupStatusPage(cfg *config.Config, _ Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if cfg == nil || !cfg.StatusPage.Enabled {
@@ -1440,7 +1439,6 @@ func statusPageResponds(ctx context.Context, port int) bool {
 		}
 	}
 }
-
 
 // setupSync installs the timer that pushes the workspace to the bucket, and the
 // exclusion filter it syncs through.

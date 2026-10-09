@@ -356,13 +356,14 @@ func TestRunCycleMissingConfigIsAnError(t *testing.T) {
 
 func TestRunDaemonRepeatsCyclesAndStopsCleanly(t *testing.T) {
 	db := cycleDB(t)
-
+    runsDone := make(chan struct{}, 10)
 	var runs atomic.Int32
 
 	tasks := []*setup.Task{{
 		Name: "counter",
 		Run: func(context.Context) error {
 			runs.Add(1)
+			runsDone <- struct{}{}
 			return nil
 		},
 	}}
@@ -382,8 +383,15 @@ func TestRunDaemonRepeatsCyclesAndStopsCleanly(t *testing.T) {
 			testRetryDelay)
 	}()
 
-	time.Sleep(120 * time.Millisecond)
-	cancel()
+	for i := 0; i < 2; i++ {
+    select {
+    case <-runsDone:
+    case <-time.After(10 * time.Second):
+        cancel()
+        t.Fatal("daemon did not complete two task runs")
+    }
+   }
+    cancel()
 
 	select {
 	case code := <-done:
