@@ -1315,6 +1315,7 @@ func containerLogs(ctx context.Context, container string, lines int) string {
 	return out
 }
 
+
 func setupStatusPage(cfg *config.Config, _ Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if cfg == nil || !cfg.StatusPage.Enabled {
@@ -1328,68 +1329,69 @@ func setupStatusPage(cfg *config.Config, _ Layout) func(context.Context) error {
 		}
 
 		const service = "chotu-status.service"
+		url := fmt.Sprintf("http://127.0.0.1:%d/", port)
 
 		slog.Info(
-			"checking status service",
+			"checking status page health",
 			"component", "status",
 			"service", service,
-			"port", port,
+			"url", url,
 		)
 
-		// First, try ensuring the service is cleanly running.
-		if _, err := run(ctx, "systemctl", "is-active", "--quiet", service); err == nil {
-			if statusPageResponds(ctx, port) {
-				slog.Info("status page ready", "component", "status", "service", service, "port", port)
-				return nil
-			}
-
-			slog.Warn("status service is running but status page is not responding; restarting service",
-				"component", "status", "service", service, "port", port)
-		} else {
-			slog.Warn("status service is not running; restarting service",
-				"component", "status", "service", service)
+		// The HTTP response is the source of truth for health.
+		if statusPageResponds(ctx, port) {
+			slog.Info("status page healthy", "component", "status", "url", url)
+			return nil
 		}
 
-		// The service wasn't running or wasn't responding. We'll try to restart it.
-		// However, before we restart, we want to clear out any old/stale process occupying
-		// the port, avoiding "bind: address already in use".
-		if isRoot() && commandExists("fuser") {
-			// Ignore errors from fuser, as it might just mean no process was listening
-			_, _ = execOutputCtx(ctx, "fuser", "-k", "-9", fmt.Sprintf("%d/tcp", port))
-		}
+		slog.Warn(
+			"status page is not responding; attempting service recovery",
+			"component", "status",
+			"service", service,
+			"url", url,
+		)
 
+		// Recover an existing systemd-managed service.
+		// A missing unit must be installed by the setup/bootstrap layer.
 		if out, err := execOutputCtx(ctx, "systemctl", "restart", service); err != nil {
-			// If restart failed, maybe the service is not enabled/installed.
-			slog.Error("failed to restart status service", "component", "status", "service", service, "error", err, "output", strings.TrimSpace(out))
-			return fmt.Errorf("restart status service: %w", err)
-		}
+			output := strings.TrimSpace(out)
 
-		slog.Info(
-			"status service restarted; checking status page",
-			"component", "status",
-			"service", service,
-			"port", port,
-		)
-
-		if !statusPageResponds(ctx, port) {
 			slog.Error(
-				"status page is not responding after service restart",
+				"could not restart status service",
 				"component", "status",
 				"service", service,
-				"port", port,
+				"error", err,
+				"output", output,
 			)
 
 			return fmt.Errorf(
-				"status service is running but status page at http://127.0.0.1:%d/ is not responding after restart",
-				port,
+				"status page is unhealthy and service recovery failed; install/configure %s before retrying: %w",
+				service,
+				err,
+			)
+		}
+
+		// Wait for the service to become healthy after restart.
+		if !statusPageResponds(ctx, port) {
+			slog.Error(
+				"status page remains unhealthy after restart",
+				"component", "status",
+				"service", service,
+				"url", url,
+			)
+
+			return fmt.Errorf(
+				"status page at %s is not responding after restarting %s",
+				url,
+				service,
 			)
 		}
 
 		slog.Info(
-			"status page ready after service restart",
+			"status page healthy after recovery",
 			"component", "status",
 			"service", service,
-			"port", port,
+			"url", url,
 		)
 
 		return nil
@@ -1397,24 +1399,48 @@ func setupStatusPage(cfg *config.Config, _ Layout) func(context.Context) error {
 }
 
 func statusPageResponds(ctx context.Context, port int) bool {
-	deadline := time.NewTimer(30 * time.Second)
+	const (
+		timeout  = 30 * time.Second
+		interval = 1 * time.Second
+	)
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
-	for {
-		if _, err := run(ctx, "curl", "-fsS", "--max-time", "1",
-			fmt.Sprintf("http://127.0.0.1:%d/", port)); err == nil {
-			return true
-		}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
+	check := func() bool {
+		_, err := run(
+			ctx,
+			"curl",
+			"-fsS",
+			"--max-time", "1",
+			url,
+		)
+		return err == nil
+	}
+
+	// Check immediately before waiting for the next tick.
+	if check() {
+		return true
+	}
+
+	for {
 		select {
 		case <-ctx.Done():
 			return false
 		case <-deadline.C:
 			return false
-		case <-time.After(1 * time.Second):
+		case <-ticker.C:
+			if check() {
+				return true
+			}
 		}
 	}
 }
+
 
 // setupSync installs the timer that pushes the workspace to the bucket, and the
 // exclusion filter it syncs through.
