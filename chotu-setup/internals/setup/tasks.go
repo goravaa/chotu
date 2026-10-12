@@ -1520,12 +1520,11 @@ WantedBy=timers.target
 // Regenerating a dependency tree is expensive and the synced workspace is
 // source code, not a build artefact.
 var defaultSyncExclusions = []string{
-	".git/**",
-	"node_modules/**",
-	".venv/**",
-	"__pycache__/**",
-	".cache/**",
-	".chotu-write-probe",
+    "- node_modules/**",
+    "- .venv/**",
+    "- __pycache__/**",
+    "- .cache/**",
+    "- .chotu-write-probe",
 }
 
 func writeWorkspaceFilter(cfg *config.Config, layout Layout) (string, error) {
