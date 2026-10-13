@@ -19,8 +19,26 @@ readonly CHOTU_LOG_FILE="/var/log/chotu-bootstrap.log"
 readonly STATUS_BINARY="/usr/local/bin/status-service"
 readonly SETUP_BINARY="/usr/local/bin/chotu-setup"
 
-readonly STATUS_BINARY_URL="${STATUS_BINARY_URL:-https://example.com/status-service}"
-readonly SETUP_BINARY_URL="${SETUP_BINARY_URL:-https://example.com/chotu-setup}"
+# Binaries come from the chotu GitHub release page. The artifact names match
+# what `make release` publishes in chotu-setup and status-service, and the
+# architecture is detected from the machine itself.
+#
+# Nothing is published there yet. Until the first release, override
+# STATUS_BINARY_URL and SETUP_BINARY_URL in the environment to point at a dev
+# build; the download failure otherwise names the exact URL that is missing.
+readonly CHOTU_RELEASE_VERSION="${CHOTU_RELEASE_VERSION:-v0.1.0}"
+readonly CHOTU_RELEASE_BASE="${CHOTU_RELEASE_BASE:-https://github.com/goravaa/chotu/releases/download}"
+
+release_arch() {
+    case "$(uname -m)" in
+        x86_64) echo "amd64" ;;
+        aarch64 | arm64) echo "arm64" ;;
+        *) die "Unsupported architecture $(uname -m): chotu publishes amd64 and arm64 binaries" ;;
+    esac
+}
+
+readonly STATUS_BINARY_URL="${STATUS_BINARY_URL:-${CHOTU_RELEASE_BASE}/${CHOTU_RELEASE_VERSION}/chotu-status-linux-$(release_arch)}"
+readonly SETUP_BINARY_URL="${SETUP_BINARY_URL:-${CHOTU_RELEASE_BASE}/${CHOTU_RELEASE_VERSION}/chotu-setup-linux-$(release_arch)}"
 
 log() {
     printf '[%s] %s\n' "$(date -Is)" "$*" | tee -a "${CHOTU_LOG_FILE}"
@@ -110,7 +128,7 @@ Requires=chotu-status.service
 
 [Service]
 Type=simple
-ExecStart=${SETUP_BINARY}
+ExecStart=${SETUP_BINARY} -config /etc/chotu/config.yaml
 Restart=always
 RestartSec=2
 
