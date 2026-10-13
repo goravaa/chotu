@@ -44,7 +44,7 @@ machine:
 # Persistent workspace storage and synchronization.
 s3:
   enabled: true
-  bucket_name: chotu-workspace
+  bucket_name: chotu-324330563475-us-west-2-an
   region: us-west-2
 
   sync:

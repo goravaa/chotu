@@ -812,3 +812,150 @@ func TestIndependentBodiedTasksRunInParallel(t *testing.T) {
 		t.Errorf("arrivals = %d, want 2", arrived.Load())
 	}
 }
+
+// The warmup exists to overlap the multi-GB pull with the GPU chain: it must
+// start as soon as docker is up (not behind the GPU), and vllm must wait for
+// it so the two never pull the same image concurrently.
+func TestVLLMPullWiringOverlapsGPUChain(t *testing.T) {
+	tasks := Tasks(&config.Config{})
+	byName := make(map[string]*Task, len(tasks))
+	for _, task := range tasks {
+		byName[task.Name] = task
+	}
+
+	pull, ok := byName[TaskVLLMPull]
+	if !ok {
+		t.Fatalf("no %q task in the graph", TaskVLLMPull)
+	}
+
+	for _, dep := range pull.Dependencies {
+		if dep == TaskGPU || dep == TaskDockerGPU {
+			t.Errorf("vllm-pull depends on %q: the pull would serialise behind the GPU chain it should overlap", dep)
+		}
+	}
+
+	hasDocker := false
+	for _, dep := range pull.Dependencies {
+		if dep == TaskDocker {
+			hasDocker = true
+		}
+	}
+	if !hasDocker {
+		t.Errorf("vllm-pull dependencies = %v, want %q among them (pull as soon as docker is ready)", pull.Dependencies, TaskDocker)
+	}
+
+	vllm := byName[TaskVLLM]
+	waits := false
+	for _, dep := range vllm.Dependencies {
+		if dep == TaskVLLMPull {
+			waits = true
+		}
+	}
+	if !waits {
+		t.Errorf("vllm dependencies = %v, want %q so it never pulls concurrently with the warmup", vllm.Dependencies, TaskVLLMPull)
+	}
+}
+
+// The warmup is best-effort: whatever docker says (missing daemon, registry
+// outage, bogus image), it reports success so vllm never goes BLOCKED behind
+// it. The invalid-registry image fails the pull fast with or without a daemon
+// present, so this stays hermetic.
+func TestVLLMImageWarmupIsBestEffort(t *testing.T) {
+	if err := setupVLLMImageWarmup(nil)(context.Background()); err != nil {
+		t.Errorf("nil config: %v, want nil (nothing to warm)", err)
+	}
+
+	cfg := &config.Config{}
+	cfg.Inference.Image = "invalid.invalid/chotu-warmup-test:latest"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	if err := setupVLLMImageWarmup(cfg)(ctx); err != nil {
+		t.Errorf("failed pull: %v, want nil (vllm owns the real error)", err)
+	}
+}
+
+// The smoke-test image must stay pinned: a floating `ubuntu` tag re-pulls
+// unpredictably and makes failures unreproducible.
+func TestGPUSmokeImageIsPinned(t *testing.T) {
+	if gpuSmokeImage == "ubuntu" || strings.HasSuffix(gpuSmokeImage, ":latest") {
+		t.Errorf("gpuSmokeImage = %q, want a pinned tag, not a floating one", gpuSmokeImage)
+	}
+
+	if !strings.Contains(gpuSmokeImage, ":") {
+		t.Errorf("gpuSmokeImage = %q, want an explicit tag", gpuSmokeImage)
+	}
+}
+
+// A freshly installed driver that has not been rebooted into must say so;
+// anything else must not send the operator down the reboot-and-hope path.
+func TestClassifyNvidiaSmiFailureDistinguishesRebootPending(t *testing.T) {
+	pending := testLayout(t)
+	if err := os.MkdirAll(pending.StateDir, 0o755); err != nil {
+		t.Fatalf("mkdir statedir: %v", err)
+	}
+	if err := os.WriteFile(rebootMarker(pending), []byte("test\n"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	err := classifyNvidiaSmiFailure(pending, errors.New("exit status 1"))
+	if !strings.Contains(err.Error(), "reboot is still pending") {
+		t.Errorf("pending error = %q, want it to name the pending reboot", err)
+	}
+
+	clear := testLayout(t)
+	if err := os.MkdirAll(clear.StateDir, 0o755); err != nil {
+		t.Fatalf("mkdir statedir: %v", err)
+	}
+
+	err = classifyNvidiaSmiFailure(clear, errors.New("exit status 1"))
+	if strings.Contains(err.Error(), "reboot is still pending") {
+		t.Errorf("no-marker error = %q, want no reboot claim without a marker", err)
+	}
+	if !strings.Contains(err.Error(), "out of step") {
+		t.Errorf("no-marker error = %q, want the driver-mismatch diagnosis", err)
+	}
+}
+
+// The fingerprint gates container recreation: identical inputs must be stable
+// (or every daemon upgrade restarts a serving model), while knob changes must
+// recreate (or the container serves stale config forever).
+func TestVLLMFingerprintStableAndSensitive(t *testing.T) {
+	cfg := func(maxLen int, util float64) *config.Config {
+		c := &config.Config{}
+		c.Inference.Resources.MaxModelLen = maxLen
+		c.Inference.Resources.GPUMemoryUtilization = util
+		return c
+	}
+
+	base := vllmFingerprint(cfg(14336, 0.97), "img", 8000, "model")
+	if vllmFingerprint(cfg(14336, 0.97), "img", 8000, "model") != base {
+		t.Error("fingerprint is not stable for identical inputs")
+	}
+
+	for name, changed := range map[string]string{
+		"max-model-len": vllmFingerprint(cfg(8192, 0.97), "img", 8000, "model"),
+		"gpu-util":      vllmFingerprint(cfg(14336, 0.9), "img", 8000, "model"),
+		"image":         vllmFingerprint(cfg(14336, 0.97), "other", 8000, "model"),
+		"model":         vllmFingerprint(cfg(14336, 0.97), "img", 8000, "other"),
+		"port":          vllmFingerprint(cfg(14336, 0.97), "img", 8001, "model"),
+	} {
+		if changed == base {
+			t.Errorf("fingerprint did not change when %s changed", name)
+		}
+	}
+}
+
+// The "wrong model" error must stay one line: /v1/models can be kilobytes.
+func TestSummarizeModelsStaysShort(t *testing.T) {
+	body := `{"object":"list","data":[{"id":"model-a","object":"model"},{"id":"model-b","object":"model"}]}`
+	got := summarizeModels(body)
+	if !strings.Contains(got, "model-a") || len(got) > 300 {
+		t.Errorf("summarize = %q, want the IDs in one short line", got)
+	}
+
+	if got := summarizeModels(""); got == "" {
+		t.Error("empty body summarized to empty: want a placeholder")
+	}
+}

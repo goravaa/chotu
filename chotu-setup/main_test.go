@@ -356,13 +356,14 @@ func TestRunCycleMissingConfigIsAnError(t *testing.T) {
 
 func TestRunDaemonRepeatsCyclesAndStopsCleanly(t *testing.T) {
 	db := cycleDB(t)
-
+    runsDone := make(chan struct{}, 10)
 	var runs atomic.Int32
 
 	tasks := []*setup.Task{{
 		Name: "counter",
 		Run: func(context.Context) error {
 			runs.Add(1)
+			runsDone <- struct{}{}
 			return nil
 		},
 	}}
@@ -379,11 +380,19 @@ func TestRunDaemonRepeatsCyclesAndStopsCleanly(t *testing.T) {
 			staticTasks(tasks),
 			5*time.Millisecond,
 			testAttempts,
-			testRetryDelay)
+			testRetryDelay,
+			time.Hour)
 	}()
 
-	time.Sleep(120 * time.Millisecond)
-	cancel()
+	for i := 0; i < 2; i++ {
+    select {
+    case <-runsDone:
+    case <-time.After(10 * time.Second):
+        cancel()
+        t.Fatal("daemon did not complete two task runs")
+    }
+   }
+    cancel()
 
 	select {
 	case code := <-done:
@@ -423,7 +432,8 @@ func TestRunDaemonStopsImmediatelyOnCancelledContext(t *testing.T) {
 		staticTasks([]*setup.Task{okTask("storage")}),
 		time.Hour,
 		testAttempts,
-		testRetryDelay)
+		testRetryDelay,
+		time.Hour)
 
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0", code)
