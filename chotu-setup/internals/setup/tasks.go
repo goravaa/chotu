@@ -1520,11 +1520,11 @@ WantedBy=timers.target
 // Regenerating a dependency tree is expensive and the synced workspace is
 // source code, not a build artefact.
 var defaultSyncExclusions = []string{
-    "- node_modules/**",
-    "- .venv/**",
-    "- __pycache__/**",
-    "- .cache/**",
-    "- .chotu-write-probe",
+	"- node_modules/**",
+	"- .venv/**",
+	"- __pycache__/**",
+	"- .cache/**",
+	"- .chotu-write-probe",
 }
 
 func writeWorkspaceFilter(cfg *config.Config, layout Layout) (string, error) {
@@ -1534,26 +1534,39 @@ func writeWorkspaceFilter(cfg *config.Config, layout Layout) (string, error) {
 		return "", err
 	}
 
-	// Union the defaults with the user's, keeping the defaults even if the user
-	// replaces the list: a user who syncs node_modules has usually made a
-	// mistake rather than intended a 400 MB upload every minute.
-	seen := make(map[string]bool, len(defaultSyncExclusions))
+	seen := make(map[string]bool)
 	lines := make([]string, 0, len(defaultSyncExclusions)+len(cfg.S3.Sync.Exclusions))
 
-	for _, pattern := range append(append([]string{}, defaultSyncExclusions...), cfg.S3.Sync.Exclusions...) {
+	patterns := append(
+		append([]string{}, defaultSyncExclusions...),
+		cfg.S3.Sync.Exclusions...,
+	)
+
+	for _, pattern := range patterns {
 		pattern = strings.TrimSpace(pattern)
-		if pattern == "" || seen[pattern] {
+		if pattern == "" {
 			continue
 		}
 
+		// Normalize existing exclusion rules.
+		pattern = strings.TrimPrefix(pattern, "- ")
+		pattern = strings.TrimSpace(pattern)
+
+		if pattern == "" || seen[pattern] {
+			continue
+		}
 		seen[pattern] = true
 
-		lines = append(lines, pattern)
+		lines = append(lines, "- "+pattern)
 	}
 
 	path := filepath.Join(dir, "workspace-filter")
 
-	if _, err := writeFileIfChanged(path, strings.Join(lines, "\n")+"\n", 0o644); err != nil {
+	if _, err := writeFileIfChanged(
+		path,
+		strings.Join(lines, "\n")+"\n",
+		0o644,
+	); err != nil {
 		return "", err
 	}
 
