@@ -25,6 +25,7 @@ const (
 	TaskTooling   = "tooling"
 	TaskWorkspace = "workspace"
 	TaskOpenCode  = "opencode"
+	TaskVLLMPull  = "vllm-pull"
 	TaskVLLM      = "vllm"
 	TaskSync      = "sync"
 )
@@ -43,8 +44,6 @@ const (
 	// defaultNvidiaDriverPackage is pinned by Chotu rather than exposed in the
 	// config, because the driver has to match the kernel the image was built with.
 	defaultNvidiaDriverPackage = "nvidia-driver-580-server"
-
-	dockerContainerName = "chotu-vllm"
 )
 
 // nvidiaDriverPackage returns the driver package to install and the matching
@@ -126,8 +125,25 @@ func Tasks(cfg *config.Config) []*Task {
 			Run:          setupOpenCode(cfg, layout),
 		},
 		{
+			// The warmup pulls the multi-GB inference image as soon as the
+			// Docker daemon is up, while the GPU chain (driver install, CDI,
+			// runtime wiring) still runs in parallel. It depends only on the
+			// docker chain precisely so it overlaps the GPU chain instead of
+			// waiting behind it.
+			//
+			// Best-effort by design: it always reports success and setupVLLM
+			// does the authoritative inspect+pull. A registry outage must warm
+			// nothing, not block the vLLM task behind a failed dependency.
+			// Retries is 1 because retrying a gigabytes-large pull inside
+			// this task only duplicates what setupVLLM already does.
+			Name:         TaskVLLMPull,
+			Dependencies: []string{TaskStatus, TaskMachine, TaskStorage, TaskDocker},
+			Retries:      1,
+			Run:          setupVLLMImageWarmup(cfg),
+		},
+		{
 			Name:         TaskVLLM,
-			Dependencies: []string{TaskStatus, TaskMachine, TaskDockerGPU, TaskStorage},
+			Dependencies: []string{TaskStatus, TaskMachine, TaskDockerGPU, TaskStorage, TaskVLLMPull},
 			Run:          setupVLLM(cfg, layout),
 		},
 		{
@@ -588,10 +604,7 @@ func setupGPU(_ *config.Config, layout Layout) func(context.Context) error {
 			"--format=csv,noheader",
 		)
 		if err != nil {
-			return fmt.Errorf(
-				"nvidia-smi cannot reach the GPU. A newly installed driver needs a reboot: %w",
-				err,
-			)
+			return classifyNvidiaSmiFailure(layout, err)
 		}
 
 		// The GPU is working, so any earlier reboot request is satisfied.
@@ -613,6 +626,39 @@ func setupGPU(_ *config.Config, layout Layout) func(context.Context) error {
 
 		return nil
 	}
+}
+
+// rebootPending reports whether a task previously recorded that the machine
+// has to restart before setup can continue.
+func rebootPending(layout Layout) bool {
+	_, err := os.Stat(rebootMarker(layout))
+
+	return err == nil
+}
+
+// classifyNvidiaSmiFailure turns "nvidia-smi failed" into the specific
+// condition it is. The old message always blamed a pending reboot, which sent
+// a machine with a genuinely broken driver (or a toolkit/userspace skew after
+// the marker was cleared) down the reboot-and-hope path instead of the fix it
+// needed.
+func classifyNvidiaSmiFailure(layout Layout, err error) error {
+	if rebootPending(layout) {
+		return fmt.Errorf(
+			"nvidia-smi cannot reach the GPU and a reboot is still pending: the driver "+
+				"was installed but its kernel module is not loaded yet; reboot the machine "+
+				"and the next cycle will finish the setup: %w",
+			err,
+		)
+	}
+
+	return fmt.Errorf(
+		"nvidia-smi cannot reach the GPU and no reboot is pending: the driver userspace "+
+			"and the kernel module are out of step (wrong driver branch for this kernel, "+
+			"or headers were missing at install time). Check `dkms status` and "+
+			"`modinfo nvidia`, and set CHOTU_NVIDIA_DRIVER_PACKAGE to the branch built "+
+			"for the running kernel: %w",
+		err,
+	)
 }
 
 func installNvidiaStack(ctx context.Context, layout Layout) error {
@@ -651,6 +697,16 @@ func installNvidiaStack(ctx context.Context, layout Layout) error {
 			)
 		}
 
+		// Install the container toolkit in the same cycle. Its packages do not
+		// need a loaded driver, only the repository and the binaries, so doing
+		// it now saves a whole second cycle (plus another apt-get update)
+		// after the reboot. A failure here is not fatal: the reboot is still
+		// required for the driver, and the toolkit install is retried
+		// post-reboot when setupGPU runs again.
+		if err := installToolkit(ctx); err != nil {
+			slog.Info(fmt.Sprintf("container toolkit install deferred until after the reboot: %v", err), "component", "gpu")
+		}
+
 		// The driver will not load until the machine reboots, and the daemon
 		// cannot usefully verify the GPU before that. Record the need for a
 		// reboot where the bootstrap step can see it, and say so explicitly:
@@ -669,6 +725,14 @@ func installNvidiaStack(ctx context.Context, layout Layout) error {
 		return ErrRebootRequired{Message: fmt.Sprintf("reboot required: %s was just installed and the driver is not loaded yet", driver)}
 	}
 
+	return installToolkit(ctx)
+}
+
+// installToolkit adds the NVIDIA container-toolkit repository and installs the
+// package. It is used both pre-reboot (best-effort, inside the driver-install
+// cycle so a fresh machine pays one apt transaction instead of two) and
+// post-reboot (as the hard requirement before CDI verification).
+func installToolkit(ctx context.Context) error {
 	const (
 		keyURL  = "https://nvidia.github.io/libnvidia-container/gpgkey"
 		keyring = "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
@@ -718,10 +782,17 @@ func configureCdi() error {
 
 	// A refresh service that was just installed may still be settling, so give
 	// the spec a moment to appear before calling it missing.
+	last := ""
 	for attempt := range 3 {
 		out, err := execOutput("nvidia-ctk", "cdi", "list")
 		if err == nil && strings.Contains(out, "nvidia.com/gpu") {
 			return nil
+		}
+
+		if err != nil {
+			last = strings.TrimSpace(out + ": " + err.Error())
+		} else {
+			last = strings.TrimSpace(out)
 		}
 
 		slog.Info(fmt.Sprintf("CDI does not expose a GPU yet (attempt %d)", attempt+1), "component", "gpu")
@@ -730,10 +801,21 @@ func configureCdi() error {
 	}
 
 	return fmt.Errorf(
-		"NVIDIA CDI did not expose any GPU: the driver userspace and the kernel " +
-			"module are out of step, which usually needs a reboot",
+		"NVIDIA CDI did not expose any GPU after 3 attempts: the driver userspace and the "+
+			"kernel module are out of step, which usually needs a reboot. "+
+			"Check `systemctl status nvidia-cdi-refresh.service` and `nvidia-ctk cdi list`; "+
+			"last output: %s",
+		last,
 	)
 }
+
+// gpuSmokeImage is the image the docker-gpu smoke test runs nvidia-smi in.
+// It is pinned to an LTS tag for the same reason the vLLM image is pinned: a
+// floating `ubuntu` tag moves and re-pulls unpredictably, which makes a steady
+// cycle slow and a failure hard to reproduce. The toolkit injects the driver
+// libraries and nvidia-smi into the container, so any small Linux image works;
+// this one is chosen because it is already the most likely to be cached.
+const gpuSmokeImage = "ubuntu:22.04"
 
 // setupDockerGPU proves the whole host-to-container path works, not just that
 // the pieces are installed. The runtime being registered in the daemon config
@@ -741,12 +823,12 @@ func configureCdi() error {
 func setupDockerGPU(_ *config.Config, _ Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if !commandExists("nvidia-ctk") {
-			return fmt.Errorf("nvidia-ctk is not installed: install the NVIDIA container toolkit")
+			return fmt.Errorf("nvidia-ctk is not installed: install the NVIDIA container toolkit (gpu task)")
 		}
 
 		out, err := run(ctx, "docker", "info", "--format", "{{json .Runtimes}}")
 		if err != nil {
-			return fmt.Errorf("read docker runtimes: %w", err)
+			return fmt.Errorf("docker daemon unreachable, cannot verify the nvidia runtime (docker task): %w", err)
 		}
 
 		justConfigured := false
@@ -781,10 +863,25 @@ func setupDockerGPU(_ *config.Config, _ Layout) func(context.Context) error {
 		runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 
+		// The smoke image is tiny but still a network fetch on a cold machine.
+		// Skip the pull when it is already cached so a steady cycle never pays
+		// for it, and so a registry outage cannot fail a machine whose image
+		// is already there.
+		if _, err := execOutputCtx(runCtx, "docker", "image", "inspect", gpuSmokeImage); err != nil {
+			if out, err := execOutputCtx(runCtx, "docker", "pull", gpuSmokeImage); err != nil {
+				return fmt.Errorf(
+					"pull the gpu smoke-test image %s (network/registry): %w: %s",
+					gpuSmokeImage,
+					err,
+					strings.TrimSpace(out),
+				)
+			}
+		}
+
 		if out, err := execOutputCtx(runCtx, "docker", "run", "--rm",
-			"--device", "nvidia.com/gpu=all", "ubuntu", "nvidia-smi"); err != nil {
+			"--device", "nvidia.com/gpu=all", gpuSmokeImage, "nvidia-smi"); err != nil {
 			return fmt.Errorf(
-				"docker can run containers but not on the GPU: %w: %s",
+				"docker can run containers but not on the GPU (CDI device injection): %w: %s",
 				err,
 				strings.TrimSpace(out),
 			)
@@ -1065,254 +1162,6 @@ func writeOpenCodeConfig(cfg *config.Config, layout Layout) error {
 	}
 
 	return nil
-}
-
-func inferencePort(cfg *config.Config) int {
-	if cfg == nil || cfg.Inference.Port == 0 {
-		return 8000
-	}
-
-	return cfg.Inference.Port
-}
-
-func inferenceModel(cfg *config.Config) string {
-	if cfg == nil || cfg.Inference.Model == "" {
-		return "local-model"
-	}
-
-	return cfg.Inference.Model
-}
-
-func maxModelLen(cfg *config.Config) int {
-	if cfg == nil || cfg.Inference.Resources.MaxModelLen == 0 {
-		return 14336
-	}
-
-	return cfg.Inference.Resources.MaxModelLen
-}
-
-func maxOutputTokens(cfg *config.Config) int {
-	if cfg == nil || cfg.Inference.Resources.MaxOutputTokens == 0 {
-		return 4096
-	}
-
-	return cfg.Inference.Resources.MaxOutputTokens
-}
-
-// setupVLLM runs the inference container and waits for it to actually serve the
-// configured model. A container that Docker reports as running is not ready: it
-// still has to load the model, and a failed download must not be reported as
-// success.
-func setupVLLM(cfg *config.Config, layout Layout) func(context.Context) error {
-	return func(ctx context.Context) error {
-		if cfg == nil {
-			slog.Info("no config, nothing to do", "component", "vllm")
-
-			return nil
-		}
-
-		image := inferenceImage(cfg)
-		port := inferencePort(cfg)
-		model := inferenceModel(cfg)
-
-		if err := reconcileVLLMContainer(ctx, cfg, layout, image, port, model); err != nil {
-			return err
-		}
-
-		endpoint := fmt.Sprintf("http://127.0.0.1:%d/v1/models", port)
-
-		out, err := waitForInference(ctx, endpoint, model, 30*time.Minute)
-		if err != nil {
-			if logs := containerLogs(ctx, dockerContainerName, 200); logs != "" {
-				slog.Info(fmt.Sprintf("last %d log lines:\n%s", 200, logs), "component", "vllm")
-			}
-
-			return err
-		}
-
-		slog.Info(fmt.Sprintf("serving %s on port %d", model, port), "component", "vllm")
-		slog.Info(fmt.Sprintf("/v1/models: %s", out), "component", "vllm")
-
-		return nil
-	}
-}
-
-// defaultInferenceImage is the fallback when config.yaml does not name an
-// image. It is pinned to a version and a digest for the same reason the config
-// is: `latest` moves several times a week, and vLLM's command line changes with
-// it, so a machine can start failing without anything in Chotu changing.
-const defaultInferenceImage = "vllm/vllm-openai:v0.30.0-x86_64" +
-	"@sha256:5f5e535216848d0c52159c8c13a0af04be5f6fe1a84e79914300610796f76d40"
-
-func inferenceImage(cfg *config.Config) string {
-	if cfg == nil || cfg.Inference.Image == "" {
-		return defaultInferenceImage
-	}
-
-	return cfg.Inference.Image
-}
-
-func reconcileVLLMContainer(
-	ctx context.Context,
-	cfg *config.Config,
-	layout Layout,
-	image string,
-	port int,
-	model string,
-) error {
-	fingerprint := vllmFingerprint(cfg, image, port, model)
-
-	// The container is recreated when the configuration it was created from
-	// changes, and left alone when it matches, so a steady cycle does not
-	// restart a model that is already serving.
-	if existing, err := run(ctx, "docker", "inspect", "--format",
-		`{{index .Config.Labels "chotu.fingerprint"}} {{.State.Running}}`, dockerContainerName); err == nil {
-		fields := strings.Fields(existing)
-
-		if len(fields) == 2 && fields[0] == fingerprint && fields[1] == "true" {
-			if ready, _ := inferenceReady(ctx, port, model); ready {
-				return nil
-			}
-		}
-
-		slog.Info(fmt.Sprintf("replacing the existing %s container", dockerContainerName), "component", "vllm")
-
-		if _, err := run(ctx, "docker", "rm", "-f", dockerContainerName); err != nil {
-			return fmt.Errorf("remove the old vllm container: %w", err)
-		}
-	}
-
-	// Pulling a multi-gigabyte image needs more than the command timeout, and
-	// it gets a budget of its own so it cannot eat into starting the container.
-	pullCtx, cancelPull := context.WithTimeout(ctx, 30*time.Minute)
-	defer cancelPull()
-
-	if out, err := execOutputCtx(pullCtx, "docker", "pull", image); err != nil {
-		return fmt.Errorf("pull %s: %w: %s", image, err, strings.TrimSpace(out))
-	}
-
-	cancelPull()
-
-	runCtx, cancelRun := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancelRun()
-
-	args := []string{
-		"run", "-d",
-		"--name", dockerContainerName,
-		"--restart", "unless-stopped",
-		"--device", "nvidia.com/gpu=all",
-		"--ipc=host",
-		"--label", "chotu.fingerprint=" + fingerprint,
-		"-p", fmt.Sprintf("%d:8000", port),
-		"-v", layout.ModelCache + ":/root/.cache/huggingface",
-		image,
-		"--model", model,
-		"--max-model-len", fmt.Sprint(maxModelLen(cfg)),
-		"--gpu-memory-utilization", fmt.Sprintf("%g", gpuMemoryUtilization(cfg)),
-	}
-
-	if parser := toolCallParser(model); parser != "" {
-		args = append(args,
-			"--enable-auto-tool-choice",
-			"--tool-call-parser", parser,
-		)
-	}
-
-	if out, err := execOutputCtx(runCtx, "docker", args...); err != nil {
-		return fmt.Errorf("start the vllm container: %w: %s", err, strings.TrimSpace(out))
-	}
-
-	return nil
-}
-
-// vllmFingerprint captures the knobs that must recreate the container when
-// they change. Image alone is not enough: max-model-len and gpu util drift
-// would otherwise leave an already-running container forever.
-func vllmFingerprint(cfg *config.Config, image string, port int, model string) string {
-	return fmt.Sprintf("%s|%s|%d|%d|%g|%s",
-		image,
-		model,
-		port,
-		maxModelLen(cfg),
-		gpuMemoryUtilization(cfg),
-		toolCallParser(model),
-	)
-}
-
-func gpuMemoryUtilization(cfg *config.Config) float64 {
-	if cfg == nil || cfg.Inference.Resources.GPUMemoryUtilization == 0 {
-		return 0.97
-	}
-
-	return cfg.Inference.Resources.GPUMemoryUtilization
-}
-
-// toolCallParser picks the vLLM tool-call parser for the configured model.
-// vLLM matches on the model name, so a model with no known parser is served
-// without one rather than with a wrong one.
-func toolCallParser(model string) string {
-	lower := strings.ToLower(model)
-
-	switch {
-	case strings.Contains(lower, "qwen3-coder"):
-		return "qwen3_coder"
-	case strings.Contains(lower, "qwen3"):
-		return "hermes"
-	case strings.Contains(lower, "llama-3.1"), strings.Contains(lower, "llama-3.2"):
-		return "llama3_json"
-	case strings.Contains(lower, "mistral"), strings.Contains(lower, "mixtral"):
-		return "mistral"
-	default:
-		return ""
-	}
-}
-
-func inferenceReady(ctx context.Context, port int, model string) (bool, error) {
-	out, err := run(ctx, "curl", "-fsS", "--max-time", "10",
-		fmt.Sprintf("http://127.0.0.1:%d/v1/models", port))
-	if err != nil {
-		return false, err
-	}
-
-	return model == "" || strings.Contains(out, model), nil
-}
-
-func waitForInference(ctx context.Context, endpoint, model string, budget time.Duration) (string, error) {
-	deadline := time.Now().Add(budget)
-
-	var last string
-
-	for {
-		out, err := execOutput("curl", "-fsS", "--max-time", "10", endpoint)
-		if err == nil {
-			if model == "" || strings.Contains(out, model) {
-				return out, nil
-			}
-
-			last = "the endpoint is up but is not serving " + model
-		} else {
-			last = err.Error()
-		}
-
-		if time.Now().After(deadline) {
-			return "", fmt.Errorf("the inference endpoint %s did not become ready in %s: %s", endpoint, budget, last)
-		}
-
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(10 * time.Second):
-		}
-	}
-}
-
-func containerLogs(ctx context.Context, container string, lines int) string {
-	out, err := run(ctx, "docker", "logs", "--tail", fmt.Sprint(lines), container)
-	if err != nil && out == "" {
-		return ""
-	}
-
-	return out
 }
 
 func setupStatusPage(cfg *config.Config, _ Layout) func(context.Context) error {
