@@ -64,7 +64,6 @@ func (c *Collector) Collect(ctx context.Context, opts Options) status.Status {
 	document.Monitoring.GPU = collectGPU(ctx)
 	document.Monitoring.Disks = collectDisks(opts.Layout)
 	document.Monitoring.Sync = collectSync(ctx)
-	document.Monitoring.OpenCodeSessions = []status.OpenCodeSession{}
 
 	return *document
 }

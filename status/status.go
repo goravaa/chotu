@@ -46,12 +46,11 @@ type ServiceStatus struct {
 }
 
 type Monitoring struct {
-	CPU              CPU               `json:"cpu"`
-	RAM              RAM               `json:"ram"`
-	GPU              GPU               `json:"gpu"`
-	Disks            []Disk            `json:"disks"`
-	Sync             Sync              `json:"sync"`
-	OpenCodeSessions []OpenCodeSession `json:"opencode_sessions"`
+	CPU   CPU     `json:"cpu"`
+	RAM   RAM     `json:"ram"`
+	GPU   GPU     `json:"gpu"`
+	Disks []Disk  `json:"disks"`
+	Sync  Sync    `json:"sync"`
 }
 
 type CPU struct {
@@ -85,12 +84,6 @@ type Sync struct {
 	Message     string `json:"message"`
 }
 
-type OpenCodeSession struct {
-	Name     string `json:"name"`
-	Folder   string `json:"folder"`
-	LastUsed string `json:"last_used"`
-}
-
 func New() *Status {
 	return &Status{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
@@ -99,8 +92,7 @@ func New() *Status {
 			Failed: []string{},
 		},
 		Monitoring: Monitoring{
-			Disks:            []Disk{},
-			OpenCodeSessions: []OpenCodeSession{},
+			Disks: []Disk{},
 		},
 	}
 }
