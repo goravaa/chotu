@@ -380,7 +380,8 @@ func TestRunDaemonRepeatsCyclesAndStopsCleanly(t *testing.T) {
 			staticTasks(tasks),
 			5*time.Millisecond,
 			testAttempts,
-			testRetryDelay)
+			testRetryDelay,
+			time.Hour)
 	}()
 
 	for i := 0; i < 2; i++ {
@@ -431,7 +432,8 @@ func TestRunDaemonStopsImmediatelyOnCancelledContext(t *testing.T) {
 		staticTasks([]*setup.Task{okTask("storage")}),
 		time.Hour,
 		testAttempts,
-		testRetryDelay)
+		testRetryDelay,
+		time.Hour)
 
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0", code)

@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
@@ -66,6 +65,11 @@ func run() int {
 		envDuration("CHOTU_SETUP_RETRY_DELAY", setup.DefaultRetryDelay),
 		"delay before the first task retry, doubled on each subsequent retry",
 	)
+	monitorInterval := flag.Duration(
+		"monitor-interval",
+		envDuration("CHOTU_MONITOR_INTERVAL", publish.DefaultMonitorInterval),
+		"how often metrics are collected and published while setup runs",
+	)
 
 	logLevelFlag := flag.String(
 		"log-level",
@@ -99,6 +103,11 @@ func run() int {
 
 	if *attempts < 1 {
 		slog.Error("invalid -attempts: must be at least 1", "attempts", *attempts)
+		return 2
+	}
+
+	if *monitorInterval <= 0 {
+		slog.Error("invalid -monitor-interval: must be positive", "monitor-interval", *monitorInterval)
 		return 2
 	}
 
@@ -151,6 +160,7 @@ func run() int {
 		"state_dir", layout.StateDir,
 		"storage_mode", layout.Mode,
 		"interval", *interval,
+		"monitor-interval", *monitorInterval,
 		"once", *once,
 		"attempts", *attempts,
 		"retry-delay", *retryDelay,
@@ -158,7 +168,12 @@ func run() int {
 
 	if *once {
 		collector := publish.NewCollector()
+		monitor := publish.NewMonitor(collector, version, *monitorInterval)
 		cycles := 1
+
+		monitorCtx, stopMonitor := context.WithCancel(ctx)
+		defer stopMonitor()
+		go monitor.Run(monitorCtx)
 
 		report, err := runCycle(
 			ctx,
@@ -167,8 +182,9 @@ func run() int {
 			setup.Tasks,
 			*attempts,
 			*retryDelay,
-			liveProgress(ctx, collector, cycles),
+			liveProgress(monitor, cycles),
 		)
+		stopMonitor()
 		if err != nil {
 			slog.Error("setup cycle failed", "error", err)
 			return 1
@@ -198,6 +214,7 @@ func run() int {
 		*interval,
 		*attempts,
 		*retryDelay,
+		*monitorInterval,
 	)
 }
 
@@ -209,10 +226,17 @@ func runDaemon(
 	interval time.Duration,
 	attempts int,
 	retryDelay time.Duration,
+	monitorInterval time.Duration,
 ) int {
 	cycles := 0
 
 	collector := publish.NewCollector()
+	monitor := publish.NewMonitor(collector, version, monitorInterval)
+
+	// The monitor owns the 1s Collect+Publish cadence for the life of the
+	// daemon. Setup goroutines only hand it snapshots (see liveProgress), so
+	// long-running tasks can never starve metrics again.
+	go monitor.Run(ctx)
 
 	for {
 		if ctx.Err() != nil {
@@ -233,16 +257,27 @@ func runDaemon(
 			tasksFor,
 			attempts,
 			retryDelay,
-			liveProgress(ctx, collector, cycles),
+			liveProgress(monitor, cycles),
 		)
 		if err != nil {
 			slog.Error("setup cycle error", "cycle", cycles, "error", err)
 		}
 
-		// Publish after every cycle, including a failed one. Mid-cycle
-		// publishes already keep the page live; this final document pins the
+		// Publish after every cycle, including a failed one. The monitor
+		// already kept the page live mid-cycle; this final document pins the
 		// terminal machine state (READY/FAILED) and the full cycle duration.
+		// The monitor snapshot is moved to the terminal state first so the
+		// next 1s tick converges on it even if a stale INITIALIZING tick is
+		// still in flight.
 		if cycle != nil {
+			monitor.Update(
+				cycle.Config,
+				cycle.Layout,
+				cycle.Results,
+				cycles,
+				cycle.MachineState,
+				time.Now().Add(-cycle.Duration),
+			)
 			publishStatus(ctx, collector, cycle, cycles)
 
 			if cycle.MachineState == string(state.StateRebootRequired) {
@@ -303,35 +338,32 @@ func (r *cycleReport) rebootRequired() bool {
 	return false
 }
 
-// liveProgress returns a hook that publishes INITIALIZING documents as the
-// task graph advances. Without this the status page stays on the previous
-// cycle (or empty) for the whole first boot while gpu/vllm run for minutes.
-//
-// Publishes are serialised: the runner fires progress from many goroutines,
-// and a single in-flight Collect+POST is enough to keep the page honest.
+// liveProgress returns a hook that hands the latest task snapshot to the
+// monitor as the graph advances. It must be cheap and never do I/O: it runs
+// on the task goroutine that just recorded the change (see
+// Runner.WithProgress), and the old implementation did Collect+POST here,
+// which blocked setup tasks behind up to 10s of subprocess/HTTP timeouts and
+// published nothing at all between state changes while gpu/vllm ran for
+// minutes. The monitor's 1s ticker owns all collection now; this hook only
+// copies the map and returns.
 func liveProgress(
-	ctx context.Context,
-	collector *publish.Collector,
+	monitor *publish.Monitor,
 	cycles int,
 ) func(*config.Config, setup.Layout, map[string]setup.TaskResult, time.Duration) {
-	var mu sync.Mutex
-
 	return func(
 		cfg *config.Config,
 		layout setup.Layout,
 		results map[string]setup.TaskResult,
 		elapsed time.Duration,
 	) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		publishStatus(ctx, collector, &cycleReport{
-			Config:       cfg,
-			Layout:       layout,
-			Results:      results,
-			MachineState: string(state.StateInitializing),
-			Duration:     elapsed,
-		}, cycles)
+		monitor.Update(
+			cfg,
+			layout,
+			results,
+			cycles,
+			string(state.StateInitializing),
+			time.Now().Add(-elapsed),
+		)
 	}
 }
 

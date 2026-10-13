@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goravaa/chotu/chotu-setup/internals/setup"
@@ -43,7 +44,12 @@ type Options struct {
 
 // Collector builds status documents. It holds the previous CPU reading,
 // because utilisation is only meaningful as a delta.
+//
+// Collect is safe for concurrent use: the monitor ticker and the end-of-cycle
+// pin can both collect, and the previous-CPU delta is serialised.
 type Collector struct {
+	mu sync.Mutex
+
 	previousCPU *cpuCounters
 }
 
@@ -59,7 +65,25 @@ func (c *Collector) Collect(ctx context.Context, opts Options) status.Status {
 	document.State = opts.MachineState
 	document.Setup = buildSetup(opts)
 
-	document.Monitoring.CPU, c.previousCPU = collectCPU(c.previousCPU)
+	// The CPU delta is the only stateful part of collection, so only it needs
+	// the lock. The subprocess/file collectors are stateless and stay outside
+	// it, so a slow nvidia-smi does not hold the delta hostage.
+	var previous *cpuCounters
+	if c != nil {
+		c.mu.Lock()
+		previous = c.previousCPU
+		c.mu.Unlock()
+	}
+
+	cpu, next := collectCPU(previous)
+
+	if c != nil {
+		c.mu.Lock()
+		c.previousCPU = next
+		c.mu.Unlock()
+	}
+
+	document.Monitoring.CPU = cpu
 	document.Monitoring.RAM = collectRAM()
 	document.Monitoring.GPU = collectGPU(ctx)
 	document.Monitoring.Disks = collectDisks(opts.Layout)
