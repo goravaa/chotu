@@ -291,9 +291,12 @@ func Page(w http.ResponseWriter, r *http.Request) {
 
             var gpu = mon.gpu || {};
             if (Number(gpu.memory_total_bytes) > 0) {
-                var gpuSub = esc(gib(gpu.memory_used_bytes)) + " of " + esc(gib(gpu.memory_total_bytes)) + " memory";
-                if (gpu.temperature_celsius != null) gpuSub += " · " + esc(gpu.temperature_celsius) + " °C";
+                var gpuSub = "";
+                if (gpu.temperature_celsius != null) gpuSub = esc(gpu.temperature_celsius) + " °C";
                 cards.push(metricCard("GPU", pct(gpu.usage_percent), gpuSub, gpu.usage_percent));
+                var vramTotal = Number(gpu.memory_total_bytes) || 0;
+                var vramUsage = vramTotal > 0 ? (Number(gpu.memory_used_bytes) || 0) / vramTotal * 100 : 0;
+                cards.push(metricCard("VRAM", pct(vramUsage), esc(gib(gpu.memory_used_bytes)) + " of " + esc(gib(gpu.memory_total_bytes)), vramUsage));
             } else {
                 cards.push(metricCard("GPU", "—", "No GPU metrics available", null));
             }
