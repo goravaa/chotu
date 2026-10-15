@@ -40,7 +40,7 @@ func Page(w http.ResponseWriter, r *http.Request) {
             font-size: 14px;
             line-height: 1.5;
         }
-        .wrap { max-width: 1120px; margin: 0 auto; padding: 30px 22px 44px; }
+        .wrap { max-width: 1400px; margin: 0 auto; padding: 30px clamp(16px, 3vw, 40px) 44px; }
         header { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
         .brand { display: flex; align-items: center; gap: 12px; }
         h1 { margin: 0; font-size: 25px; line-height: 1.2; letter-spacing: -0.035em; }
@@ -68,6 +68,8 @@ func Page(w http.ResponseWriter, r *http.Request) {
             color: var(--amber); border-radius: 9px; padding: 10px 14px; margin: 0 0 18px;
         }
         .section { margin-top: 26px; }
+        .columns { display: grid; grid-template-columns: 1.15fr 1fr; gap: 20px; align-items: start; }
+        .columns .section { margin-top: 26px; }
         .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
         h2 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.015em; }
         .section-note { color: var(--muted); font-size: 12px; }
@@ -97,6 +99,7 @@ func Page(w http.ResponseWriter, r *http.Request) {
         th { color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .075em; }
         td.name { font-weight: 550; }
         td.msg { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+        td.took { color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
         .pill { padding: 2px 9px; font-size: 10px; }
         .pill.completed { color: var(--green); border-color: rgba(53,212,154,.5); }
         .pill.failed { color: var(--red); border-color: rgba(255,107,114,.5); }
@@ -107,6 +110,7 @@ func Page(w http.ResponseWriter, r *http.Request) {
         footer { margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; }
         @media (max-width: 600px) {
             .wrap { padding: 22px 14px 32px; }
+            .columns { grid-template-columns: 1fr; }
             h1 { font-size: 22px; }
             .section-heading { align-items: start; flex-direction: column; gap: 3px; }
             th, td { padding: 9px 10px; }
@@ -121,23 +125,15 @@ func Page(w http.ResponseWriter, r *http.Request) {
             <div class="brand">
                 <div>
                     <h1>Chotu</h1>
-                    <p class="subtitle">Your AI development machine</p>
                 </div>
             </div>
             <span id="state" class="badge working">INITIALIZING</span>
         </header>
-        <p id="meta" class="meta">Waiting for status…</p>
+        <p class="meta"><span id="meta">Waiting for status…</span><span id="up"></span></p>
         <div id="conn" class="conn" role="status">Connection lost — retrying…</div>
         <div id="failed" aria-live="polite"></div>
 
-        <section class="section" aria-labelledby="health-heading">
-            <div class="section-heading">
-                <h2 id="health-heading">System health</h2>
-                <span class="section-note">Live resource usage</span>
-            </div>
-            <div id="mon"><div class="empty">Waiting for system metrics…</div></div>
-        </section>
-
+        <div class="columns">
         <section class="section" aria-labelledby="setup-heading">
             <div class="section-heading">
                 <h2 id="setup-heading">Setup progress</h2>
@@ -146,7 +142,16 @@ func Page(w http.ResponseWriter, r *http.Request) {
             <div id="tasks"><div class="empty">Waiting for setup details…</div></div>
         </section>
 
-        <footer>Chotu status · Updates automatically</footer>
+        <section class="section" aria-labelledby="resources-heading">
+            <div class="section-heading">
+                <h2 id="resources-heading">System Resources</h2>
+                <span class="section-note">Live resource usage</span>
+            </div>
+            <div id="mon"><div class="empty">Waiting for system metrics…</div></div>
+        </section>
+        </div>
+
+        <footer>Chotu status · <span id="ver"></span> · Updates automatically</footer>
     </main>
     <script>
         var stateEl = document.getElementById("state");
@@ -157,6 +162,14 @@ func Page(w http.ResponseWriter, r *http.Request) {
         var tasksEl = document.getElementById("tasks");
         var taskSummaryEl = document.getElementById("task-summary");
         var lastTimestamp = "";
+        var lastVersion = "";
+        var lastData = null;
+        var metaCache = {tasks: {}};
+
+        function displayState(s) {
+            s = String(s == null || s === "" ? "unknown" : s);
+            return s.charAt(0).toUpperCase() + s.slice(1);
+        }
 
         function esc(value) {
             return String(value == null ? "" : value)
@@ -174,6 +187,41 @@ func Page(w http.ResponseWriter, r *http.Request) {
         function pct(value) {
             var n = Number(value || 0);
             return (Math.round(n * 10) / 10) + "%";
+        }
+
+        function durStr(totalSeconds) {
+            if (totalSeconds == null) return "—";
+            var s = Math.max(0, Math.round(Number(totalSeconds)));
+            if (s < 60) return s + "s";
+            var m = Math.floor(s / 60);
+            if (m < 60) {
+                var rs = s % 60;
+                return m + "m" + (rs ? rs + "s" : "");
+            }
+            var h = Math.floor(m / 60);
+            var rm = m % 60;
+            return h + "h" + (rm ? rm + "m" : "");
+        }
+
+        function tookText(name) {
+            var entry = (metaCache.tasks || {})[name];
+            if (entry && entry.took_seconds != null) return durStr(entry.took_seconds);
+            return "—";
+        }
+
+        function renderMetaUptime() {
+            var upEl = document.getElementById("up");
+            if (upEl) upEl.textContent = (metaCache.service_uptime_seconds != null)
+                ? " · up " + durStr(metaCache.service_uptime_seconds)
+                : "";
+        }
+
+        function fetchMeta() {
+            fetch("/api/v1/meta").then(function(r) { return r.json(); }).then(function(meta) {
+                metaCache = meta || {tasks: {}};
+                renderMetaUptime();
+                if (lastData) renderTasks(lastData);
+            }).catch(function() {});
         }
 
         function barClass(usage) {
@@ -216,12 +264,15 @@ func Page(w http.ResponseWriter, r *http.Request) {
         }
 
         function renderMeta(data) {
-            metaEl.textContent = "Updated " + (ago(data.timestamp) || "just now") + " · Automatically refreshes";
+            lastVersion = data.version || lastVersion;
+            metaEl.textContent = "Updated " + (ago(data.timestamp) || "just now") + " · Automatically refreshes" + (lastVersion ? " · " + lastVersion : "");
+            var verEl = document.getElementById("ver");
+            if (verEl) verEl.textContent = lastVersion || "";
         }
 
         function taskLabel(name) {
             var labels = {
-                "machine": "Machine",
+                "machine": "Machine Check",
                 "storage": "Storage",
                 "docker": "Docker",
                 "docker-gpu": "GPU support for containers",
@@ -232,9 +283,9 @@ func Page(w http.ResponseWriter, r *http.Request) {
                 "status": "Status reporting",
                 "sync": "Workspace sync",
                 "tooling": "Development tools",
-                "vllm": "AI model service",
-                "vllm-pull": "AI model download",
-                "workspace": "Workspace"
+                "vllm": "vLLM",
+                "vllm-pull": "Download vLLM",
+                "workspace": "S3 Sync"
             };
             return labels[name] || name.replace(/[-_]+/g, " ").replace(/\b\w/g, function(ch) { return ch.toUpperCase(); });
         }
@@ -304,8 +355,8 @@ func Page(w http.ResponseWriter, r *http.Request) {
             (mon.disks || []).forEach(function(disk) { cards.push(diskCard(disk)); });
 
             var sync = mon.sync || {};
-            var syncState = String(sync.state || "unknown");
-            var syncSub = "Status: " + esc(sync.state || "unknown");
+            var syncState = displayState(sync.state);
+            var syncSub = "Status: " + esc(displayState(sync.state));
             if (sync.last_success) syncSub += "<br>Last successful sync: " + esc(ago(sync.last_success) || sync.last_success);
             else if (sync.last_attempt) syncSub += "<br>Last attempt: " + esc(ago(sync.last_attempt) || sync.last_attempt);
             if (sync.message) syncSub += "<br>" + esc(sync.message);
@@ -339,11 +390,12 @@ func Page(w http.ResponseWriter, r *http.Request) {
                 var task = tasks[name] || {};
                 return '<tr><td class="name">' + esc(taskLabel(name)) + '</td>' +
                     '<td><span class="pill ' + taskPill(task.state) + '">' + esc(task.state || "?") + '</span></td>' +
+                    '<td class="took">' + esc(tookText(name)) + '</td>' +
                     '<td class="msg">' + esc(task.message || "—") + '</td></tr>';
             }).join("");
 
-            tasksEl.innerHTML = '<div class="task-groups"><details class="task-details"><summary><span>Setup details</span><span class="task-summary-count">' + names.length + ' components</span></summary>' +
-                '<table><thead><tr><th>Component</th><th>Status</th><th>Details</th></tr></thead><tbody>' + rows + '</tbody></table></details></div>';
+            tasksEl.innerHTML = '<div class="task-groups"><details class="task-details" open><summary><span>Setup details</span><span class="task-summary-count">' + names.length + ' components</span></summary>' +
+                '<table><thead><tr><th>Component</th><th>Status</th><th>Took</th><th>Details</th></tr></thead><tbody>' + rows + '</tbody></table></details></div>';
         }
 
         function render(data) {
@@ -357,7 +409,7 @@ func Page(w http.ResponseWriter, r *http.Request) {
         }
 
         setInterval(function() {
-            if (lastTimestamp) metaEl.textContent = "Updated " + (ago(lastTimestamp) || "just now") + " · Automatically refreshes";
+            if (lastTimestamp) metaEl.textContent = "Updated " + (ago(lastTimestamp) || "just now") + " · Automatically refreshes" + (lastVersion ? " · " + lastVersion : "");
         }, 1000);
 
         var events = new EventSource("/api/v1/events");
@@ -366,6 +418,7 @@ func Page(w http.ResponseWriter, r *http.Request) {
             try {
                 var data = JSON.parse(event.data);
                 lastTimestamp = data.timestamp || "";
+                lastData = data;
                 render(data);
             } catch (err) {
                 console.error("Could not parse a status update:", err);
@@ -374,6 +427,9 @@ func Page(w http.ResponseWriter, r *http.Request) {
         events.onerror = function() {
             connEl.style.display = "block";
         };
+
+        fetchMeta();
+        setInterval(fetchMeta, 5000);
     </script>
 </body>
 </html>`

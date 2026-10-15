@@ -20,17 +20,23 @@ import (
 // than a hand-rolled one means the wiring is covered too: a GET and a POST on
 // the same path are the whole point of this API, and ServeMux cannot express it.
 func newRouter() http.Handler {
+	return newRouterWithKeeper(internals.NewKeeper())
+}
+
+func newRouterWithKeeper(keeper *internals.Keeper) http.Handler {
 	store := &internals.StatusStore{}
 	hub := internals.NewStatusHub()
 
-	statusHandler := NewStatusHandler(store, hub)
+	statusHandler := NewStatusHandler(store, hub, keeper)
 	eventHandler := NewEventHandler(store, hub)
+	metaHandler := NewMetaHandler(keeper)
 
 	r := chi.NewRouter()
 
 	r.Get("/api/v1/status", statusHandler.GetStatus)
 	r.Post("/api/v1/status", statusHandler.UpdateStatus)
 	r.Get("/api/v1/events", eventHandler.Events)
+	r.Get("/api/v1/meta", metaHandler.GetMeta)
 	r.Get("/", Page)
 
 	return r
@@ -160,6 +166,96 @@ func TestPostRejectsGarbage(t *testing.T) {
 
 	if got.Cycle != 5 {
 		t.Errorf("cycle = %d, want the last good document (5) to survive", got.Cycle)
+	}
+}
+
+// TestMetaTracksTaskDuration posts a task through pending to completed with a
+// fake clock advanced between the posts, so /api/v1/meta reports the 30s the
+// task took rather than just its final state.
+func TestMetaTracksTaskDuration(t *testing.T) {
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	current := now
+	keeper := internals.NewKeeperWithClock(func() time.Time { return current }, now)
+	router := newRouterWithKeeper(keeper)
+
+	post := func(body string) {
+		t.Helper()
+
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/status", strings.NewReader(body)))
+
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("post code = %d, want 204", recorder.Code)
+		}
+	}
+
+	post(`{"setup":{"tasks":{"gpu":{"state":"PENDING"}}}}`)
+	current = now.Add(30 * time.Second)
+	post(`{"setup":{"tasks":{"gpu":{"state":"COMPLETED"}}}}`)
+
+	recorder := get(t, router, "/api/v1/meta")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("meta code = %d, want 200", recorder.Code)
+	}
+
+	var meta struct {
+		Uptime int64 `json:"service_uptime_seconds"`
+		Tasks  map[string]struct {
+			State string   `json:"state"`
+			Took  *float64 `json:"took_seconds"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("meta must be valid JSON: %v", err)
+	}
+
+	if meta.Uptime != 30 {
+		t.Errorf("uptime = %d, want 30", meta.Uptime)
+	}
+
+	timing, ok := meta.Tasks["gpu"]
+	if !ok {
+		t.Fatal("gpu missing from meta tasks")
+	}
+
+	if timing.Took == nil {
+		t.Fatal("gpu took_seconds is null, want 30")
+	}
+
+	if *timing.Took != 30 {
+		t.Errorf("gpu took = %v, want 30", *timing.Took)
+	}
+}
+
+// TestMetaUnknownWhenAlreadyTerminal covers a service restart mid-setup: a
+// task first posted as completed finished before watching began, so took
+// stays null instead of a misleading 0.
+func TestMetaUnknownWhenAlreadyTerminal(t *testing.T) {
+	router := newRouterWithKeeper(internals.NewKeeper())
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(
+		http.MethodPost, "/api/v1/status", strings.NewReader(`{"setup":{"tasks":{"docker":{"state":"COMPLETED"}}}}`),
+	))
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("post code = %d, want 204", recorder.Code)
+	}
+
+	recorder = get(t, router, "/api/v1/meta")
+
+	var meta struct {
+		Tasks map[string]struct {
+			Took *float64 `json:"took_seconds"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("meta must be valid JSON: %v", err)
+	}
+
+	if took := meta.Tasks["docker"].Took; took != nil {
+		t.Errorf("docker took = %v, want null", *took)
 	}
 }
 
@@ -318,6 +414,10 @@ func TestPageRenders(t *testing.T) {
 
 	if !strings.Contains(recorder.Body.String(), "/api/v1/events") {
 		t.Error("the page does not subscribe to the event stream")
+	}
+
+	if !strings.Contains(recorder.Body.String(), "/api/v1/meta") {
+		t.Error("the page does not fetch task timings")
 	}
 }
 

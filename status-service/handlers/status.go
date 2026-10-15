@@ -11,15 +11,17 @@ import (
 )
 
 type StatusHandler struct {
-	store *internals.StatusStore
-	hub   *internals.StatusHub
+	store  *internals.StatusStore
+	hub    *internals.StatusHub
+	keeper *internals.Keeper
 }
 
 func NewStatusHandler(
-	store *internals.StatusStore, hub *internals.StatusHub) *StatusHandler {
+	store *internals.StatusStore, hub *internals.StatusHub, keeper *internals.Keeper) *StatusHandler {
 	return &StatusHandler{
-		store: store,
-		hub:   hub,
+		store:  store,
+		hub:    hub,
+		keeper: keeper,
 	}
 }
 
@@ -61,6 +63,10 @@ func (h *StatusHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 
 	h.hub.Broadcast(incoming)
 	log.Printf("[status %d] 5. Event created/published to the event hub", reqID)
+
+	// The keeper watches the same document, so task timings stay in step
+	// with what the page shows. A nil keeper is a no-op.
+	h.keeper.Observe(incoming)
 
 	w.WriteHeader(http.StatusNoContent)
 	log.Printf("[status %d] 7. HTTP response returned", reqID)

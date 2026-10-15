@@ -38,15 +38,18 @@ func main() {
 func run() error {
 	store := &internals.StatusStore{}
 	hub := internals.NewStatusHub()
+	keeper := internals.NewKeeper()
 
-	statusHandler := handlers.NewStatusHandler(store, hub)
+	statusHandler := handlers.NewStatusHandler(store, hub, keeper)
 	eventHandler := handlers.NewEventHandler(store, hub)
+	metaHandler := handlers.NewMetaHandler(keeper)
 
 	r := chi.NewRouter()
 
 	r.Get("/api/v1/status", statusHandler.GetStatus)
 	r.Post("/api/v1/status", statusHandler.UpdateStatus)
 	r.Get("/api/v1/events", eventHandler.Events)
+	r.Get("/api/v1/meta", metaHandler.GetMeta)
 	r.Get("/", handlers.Page)
 
 	addr := os.Getenv("CHOTU_STATUS_ADDR")
