@@ -1,7 +1,13 @@
-# Chotu user-facing machine configuration.
+# Chotu machine configuration: the daemon input format and local-dev default.
 #
-# This file describes the desired state of the Chotu machine.
-# Provisioning and machine setup components consume the fields relevant to them.
+# For real deploys, the control panel is terraform/*.tfvars, NOT this file.
+# Terraform renders /etc/chotu/config.yaml on the machine from those
+# variables (see terraform/modules/aws/templates/user_data.sh.tftpl), so
+# editing this file does not change any deployed machine. Keep this file in
+# sync with the terraform defaults when you change either side.
+#
+# The other consumer is local development: chotu-setup's `make run` loads
+# this file directly.
 #
 # Compatibility-critical versions for system packages and drivers are controlled
 # by Chotu/bootstrap and are not exposed here.
@@ -16,6 +22,8 @@ machine:
   image_id: ""
 
   region: us-west-2
+  # Local-client hint only: the daemon parses but never uses this field.
+  # Deployed machines get a terraform-generated key (see terraform outputs).
   ssh_key_path: .
 
   # A spot machine can be reclaimed at any moment, so it cannot also be
@@ -44,7 +52,7 @@ machine:
 # Persistent workspace storage and synchronization.
 s3:
   enabled: true
-  bucket_name: chotu-324330563475-us-west-2-an
+  bucket_name: chotu-workspace-324330563475-us-west-2
   region: us-west-2
 
   sync:
@@ -97,9 +105,11 @@ coding:
   opencode: true
 
 
-# Progress page served over HTTP so the user can see what the machine is doing
+# Progress page served so the user can see what the machine is doing
 # while it comes up. Bootstrap installs the status-service binary as a systemd
 # unit; the setup daemon only health-checks and restarts it.
+# Exposure (public vs SSH tunnel) is a terraform network concern, not this
+# file: terraform only opens SSH and the page is reached over the tunnel.
 status_page:
   enabled: true
   port: 8081

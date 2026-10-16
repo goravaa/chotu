@@ -9,7 +9,7 @@ PREFIX      ?= /usr/local
 BINDIR      := $(PREFIX)/bin
 UNIT_SRC    := deploy/chotu-setup.service
 UNIT_DST    := /etc/systemd/system/chotu-setup.service
-CONFIG_SRC  ?= ../config.yaml
+CONFIG_SRC  ?= ../dev.config.yaml
 CONFIG_DST  := /etc/chotu/config.yaml
 STATE_DIR   ?= /var/lib/chotu
 

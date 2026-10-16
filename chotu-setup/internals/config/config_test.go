@@ -88,7 +88,7 @@ func TestLoadRejectsIncompleteEnabledFeatures(t *testing.T) {
 // unpinned image means a machine that worked this morning can fail this
 // afternoon with nothing in Chotu having changed.
 func TestImagesArePinned(t *testing.T) {
-	cfg, err := Load(filepath.Join("..", "..", "..", "config.yaml"))
+	cfg, err := Load(filepath.Join("..", "..", "..", "dev.config.yaml"))
 	if err != nil {
 		t.Fatalf("load the shipped config: %v", err)
 	}
@@ -102,18 +102,18 @@ func TestImagesArePinned(t *testing.T) {
 	if !strings.Contains(image, "@sha256:") {
 		t.Errorf(
 			"inference.image = %q, want it pinned by digest. A version tag alone "+
-				"leaves the exact bytes unpinned; see the upgrade note in config.yaml "+
-				"for how to resolve a digest",
+			"leaves the exact bytes unpinned; see the upgrade note in dev.config.yaml "+
+			"for how to resolve a digest",
 			image,
 		)
 	}
 }
 
-// TestLoadReadsTheShippedConfig keeps the example config loadable. It is the
-// file every new machine starts from, so a field the loader does not recognise
-// is a silent behaviour change.
+// TestLoadReadsTheShippedConfig keeps the dev config loadable. It is the
+// local-run default and the reference terraform defaults are mirrored from,
+// so a field the loader does not recognise is a silent behaviour change.
 func TestLoadReadsTheShippedConfig(t *testing.T) {
-	cfg, err := Load(filepath.Join("..", "..", "..", "config.yaml"))
+	cfg, err := Load(filepath.Join("..", "..", "..", "dev.config.yaml"))
 	if err != nil {
 		t.Fatalf("load the shipped config: %v", err)
 	}

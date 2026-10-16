@@ -895,8 +895,10 @@ func setupDockerGPU(_ *config.Config, _ Layout) func(context.Context) error {
 
 // setupRclone installs rclone and writes the S3 remote. The remote uses
 // env_auth, so credentials come from the EC2 instance role and no access key
-// is ever written to disk.
-func setupRclone(_ *config.Config, layout Layout) func(context.Context) error {
+// is ever written to disk. The region is pinned from config so rclone never
+// has to discover it with GetBucketLocation, which needs its own IAM action
+// and fails into a us-east-1 redirect when it is missing.
+func setupRclone(cfg *config.Config, layout Layout) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if !packageInstalled("rclone") && !commandExists("rclone") {
 			if err := aptInstall(ctx, "rclone"); err != nil {
@@ -915,6 +917,9 @@ func setupRclone(_ *config.Config, layout Layout) func(context.Context) error {
 		}
 
 		remote := "[s3]\ntype = s3\nprovider = AWS\nenv_auth = true\n"
+		if cfg != nil && cfg.S3.Region != "" {
+			remote += "region = " + cfg.S3.Region + "\n"
+		}
 
 		configPath := filepath.Join(rcloneDir, "rclone.conf")
 		if _, err := writeFileIfChanged(configPath, remote, 0o600); err != nil {
