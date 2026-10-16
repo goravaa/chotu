@@ -35,11 +35,15 @@ Apply prints an `ssh_config_snippet`. Paste it into `~/.ssh/config`, then:
 ssh chotu
 ```
 
-With that session open: `http://localhost:8081` is the status page (setup progress, then system health), `localhost:8000` is the model endpoint. When you're done:
+With that session open: `http://localhost:8081` is the status page (setup progress, then system health), `localhost:8000` is the model endpoint. When you're done, keep the bucket and destroy everything else:
 
 ```
+# Forget the bucket resources so destroy leaves the data alone
+terraform state rm 'module.aws[0].aws_s3_bucket.workspace[0]' 'module.aws[0].aws_s3_bucket_versioning.workspace[0]' 'module.aws[0].aws_s3_bucket_public_access_block.workspace[0]'
 terraform destroy
 ```
+
+The bucket stays in AWS. On the next deploy, set `s3_create_bucket = false` to adopt it. A plain `terraform destroy` without the `state rm` fails on purpose (`prevent_destroy` on the bucket) rather than deleting workspace data.
 
 Tweaks live in `terraform/variables.tf` — instance type, region, spot vs on-demand, bucket, model. No other files to touch for a normal deploy.
 

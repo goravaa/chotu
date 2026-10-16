@@ -121,37 +121,59 @@ resource "local_file" "ssh_private_key" {
 # already exists, a data source errors if it does not. The s3_create_bucket
 # toggle picks one path; locals below resolve whichever one is active so
 # the IAM policy never cares.
+#
+# The bucket holds workspace data and must survive `terraform destroy`.
+# prevent_destroy makes a plain destroy fail instead of deleting data.
+# Teardown is: state rm the bucket resources, then destroy everything
+# else. The bucket stays in AWS and the next apply adopts it with
+# s3_create_bucket=false.
 # ---------------------------------------------------------------------------
 
 resource "aws_s3_bucket" "workspace" {
   count = var.s3_enabled && var.s3_create_bucket ? 1 : 0
 
-  bucket = var.s3_bucket_name
+  bucket        = var.s3_bucket_name
+  force_destroy = false
 
   tags = {
     Name = var.s3_bucket_name
   }
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_versioning" "workspace" {
-  count = var.s3_enabled && var.s3_create_bucket ? 1 : 0
+  # Managed in both create and adopt modes so a re-apply after teardown
+  # restores versioning even though the bucket itself was never deleted.
+  count = var.s3_enabled ? 1 : 0
 
-  bucket = aws_s3_bucket.workspace[0].id
+  bucket = var.s3_bucket_name
 
   versioning_configuration {
     status = "Enabled"
   }
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_public_access_block" "workspace" {
-  count = var.s3_enabled && var.s3_create_bucket ? 1 : 0
+  # Same as versioning: enforced whether we created or adopted the bucket.
+  count = var.s3_enabled ? 1 : 0
 
-  bucket = aws_s3_bucket.workspace[0].id
+  bucket = var.s3_bucket_name
 
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # Adopt mode reads the existing bucket at plan time. A missing bucket fails
